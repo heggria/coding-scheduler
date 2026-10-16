@@ -9,7 +9,7 @@
 5. 生产状态根目录约 142 个续跑 / bak / tgz 文件需清理（本次不删除）。
 
 ## 已完成
-- OpenCode 第三池：L 级低风险优先、满池回退原双池；显式 pin 不外溢，Codex/CC 不向 OpenCode spill。Deepseek 免费模型默认、variant=max、quota 豁免、caps 默认 4、doctor/CLI/dashboard 三池支持。实现与隔离测试交付；真实模型验收未执行，部署以任务结论为准。
+- OpenCode 第三池：L 级低风险优先、满池回退原双池；显式 pin 不外溢，Codex/CC 不向 OpenCode spill。Deepseek 免费模型默认、variant=max、quota 豁免、caps 默认 32、doctor/CLI/dashboard 三池支持。实现与隔离测试交付；真实模型验收未执行，部署以任务结论为准。
 - wave1：status 回收僵尸、exit0 但无结论→unknown（已修正早期 blocked 规则）、doctor 预检、cancel --superseded-by。
 - launchd 每 60s 自动 tick（`com.heggria.cs-tick`）。
 - Codex/CC 完全访问权限（bypass sandbox / skip-permissions）。

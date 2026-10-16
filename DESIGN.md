@@ -18,7 +18,7 @@ cs doctor
 
 ## 硬限制
 
-- Codex ≤ 24 · CC ≤ 6 · OpenCode ≤ 4（上限放在 `{CS_HOME}/caps.json`，如 `{"codex":24,"cc":6,"opencode":4}`；其次环境变量 `CS_CODEX_CAP` / `CS_CC_CAP` / `CS_OPENCODE_CAP`；默认 24/6/4。tick/status/board/dashboard `/api/state` 每次重读，改文件即生效）
+- Codex ≤ 24 · CC ≤ 6 · OpenCode ≤ 32（上限放在 `{CS_HOME}/caps.json`，如 `{"codex":24,"cc":6,"opencode":32}`；其次环境变量 `CS_CODEX_CAP` / `CS_CC_CAP` / `CS_OPENCODE_CAP`；默认 24/6/32。tick/status/board/dashboard `/api/state` 每次重读，改文件即生效）
 - 禁止子 Agent（prompt 注入）
 - L 档 CC = haiku-5.5
 - 同 worktree 的重叠写锁不并行；跨 worktree 的核心资源用共享锁

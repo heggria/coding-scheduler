@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 
-DEFAULT_CAPS = {"codex": 24, "cc": 6, "opencode": 4}
+DEFAULT_CAPS = {"codex": 24, "cc": 6, "opencode": 32}
 # Import-time defaults; reload_caps() refreshes them from caps.json / env.
 CODEX_CAP = DEFAULT_CAPS["codex"]
 CC_CAP = DEFAULT_CAPS["cc"]

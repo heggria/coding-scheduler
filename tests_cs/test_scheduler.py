@@ -95,31 +95,31 @@ class SchedulerTests(unittest.TestCase):
             os.environ.pop("CS_CODEX_CAP", None)
             os.environ.pop("CS_CC_CAP", None)
             os.environ.pop("CS_OPENCODE_CAP", None)
-            self.assertEqual(core.reload_caps(), {"codex": 24, "cc": 6, "opencode": 4})
+            self.assertEqual(core.reload_caps(), {"codex": 24, "cc": 6, "opencode": 32})
             self.assertEqual((affinity.CODEX_CAP, affinity.CC_CAP), (24, 6))
             os.environ["CS_CODEX_CAP"] = "30"
             os.environ["CS_CC_CAP"] = "bad"
-            self.assertEqual(core.reload_caps(), {"codex": 30, "cc": 6, "opencode": 4})
+            self.assertEqual(core.reload_caps(), {"codex": 30, "cc": 6, "opencode": 32})
             (self.root / "caps.json").write_text('{"codex": 8, "cc": 3}')
-            self.assertEqual(core.reload_caps(), {"codex": 8, "cc": 3, "opencode": 4})
+            self.assertEqual(core.reload_caps(), {"codex": 8, "cc": 3, "opencode": 32})
             self.assertEqual((core.CODEX_CAP, core.CC_CAP), (8, 3))
             (self.root / "caps.json").write_text('{"codex": 0, "cc": true}')
-            self.assertEqual(core.reload_caps(), {"codex": 30, "cc": 6, "opencode": 4})
+            self.assertEqual(core.reload_caps(), {"codex": 30, "cc": 6, "opencode": 32})
             (self.root / "caps.json").write_text("not json")
-            self.assertEqual(core.reload_caps(), {"codex": 30, "cc": 6, "opencode": 4})
+            self.assertEqual(core.reload_caps(), {"codex": 30, "cc": 6, "opencode": 32})
             (self.root / "caps.json").unlink()
             os.environ.pop("CS_CODEX_CAP")
-            self.assertEqual(core.reload_caps(), {"codex": 24, "cc": 6, "opencode": 4})
+            self.assertEqual(core.reload_caps(), {"codex": 24, "cc": 6, "opencode": 32})
 
     def test_import_defaults_and_status_picks_up_caps_json(self):
         import affinity
-        self.assertEqual(affinity.DEFAULT_CAPS, {"codex": 24, "cc": 6, "opencode": 4})
+        self.assertEqual(affinity.DEFAULT_CAPS, {"codex": 24, "cc": 6, "opencode": 32})
         (self.root / "caps.json").write_text('{"codex": 5}')
         out = json.loads(self.cli("status", "--json", "--no-reclaim"))
-        self.assertEqual(out["caps"], {"codex": 5, "cc": 6, "opencode": 4})
+        self.assertEqual(out["caps"], {"codex": 5, "cc": 6, "opencode": 32})
         (self.root / "caps.json").write_text('{"codex": 7, "cc": 2}')
         out = json.loads(self.cli("status", "--json", "--no-reclaim"))
-        self.assertEqual(out["caps"], {"codex": 7, "cc": 2, "opencode": 4})
+        self.assertEqual(out["caps"], {"codex": 7, "cc": 2, "opencode": 32})
         core.write_board(self.root)
         self.assertIn("Codex `0/7` · CC `0/2`", (self.root / "board.md").read_text())
 
@@ -172,11 +172,11 @@ class SchedulerTests(unittest.TestCase):
             (self.root / "caps.json").write_text('{"opencode": null}')
             self.assertEqual(core.reload_caps()["opencode"], 9)
             os.environ["CS_OPENCODE_CAP"] = "0"
-            self.assertEqual(core.reload_caps()["opencode"], 4)
+            self.assertEqual(core.reload_caps()["opencode"], 32)
         for raw in ('{"opencode": true}', '{"opencode": -1}', '{"opencode": "bad"}'):
             (self.root / "caps.json").write_text(raw)
             with patch.dict(os.environ, {"CS_OPENCODE_CAP": "invalid"}):
-                self.assertEqual(affinity.load_caps(self.root)["opencode"], 4)
+                self.assertEqual(affinity.load_caps(self.root)["opencode"], 32)
         (self.root / "caps.json").write_text('{"opencode": 3}')
         self.record("active", folder="running", pool="opencode", pid=os.getpid())
         self.assertEqual(core.counts(core.load_jobs(self.root, "running"))["opencode"], 1)

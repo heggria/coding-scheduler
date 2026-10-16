@@ -76,7 +76,7 @@ launchd 将 stdout 追加重定向到同一 tick.log 时只记 stdout 一份，�
 
 ## 池上限（caps）
 
-Codex/CC/OpenCode 并发上限默认 24/6/4，运行时读取 `{CS_HOME}/caps.json`（`{"codex":24,"cc":6,"opencode":4}`，正整数），
+Codex/CC/OpenCode 并发上限默认 24/6/32，运行时读取 `{CS_HOME}/caps.json`（`{"codex":24,"cc":6,"opencode":32}`，正整数），
 其次环境变量 `CS_CODEX_CAP` / `CS_CC_CAP` / `CS_OPENCODE_CAP`，最后用默认值。tick、status、board、dashboard `/api/state`
 每次重读，改 caps.json 无需改代码。该文件是运行时状态，不提交。
 

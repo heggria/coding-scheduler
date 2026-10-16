@@ -1,3 +1,5 @@
 __pycache__/
 *.bak-*
 /conclusion*.md
+dashboard-ui/node_modules/
+dashboard-ui/*.tsbuildinfo

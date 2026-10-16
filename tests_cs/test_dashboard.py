@@ -37,7 +37,7 @@ class DashboardTests(unittest.TestCase):
         clock.start().now.return_value = self.now
         self.addCleanup(clock.stop)
         service = patch.object(dashboard, "launchd_state", return_value={
-            "running": False, "pid": None, "last_exit_status": 0})
+            "loaded": True, "running": False, "pid": None, "last_exit_status": 0})
         service.start()
         self.addCleanup(service.stop)
         self.server = dashboard.make_server("127.0.0.1", 0, CLI["cmd_status"])
@@ -74,12 +74,13 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("text/html", headers["Content-Type"])
         self.assertIn("实时看板", body.decode())
-        self.assertIn(b"setTimeout(refresh,4000)", body)
+        self.assertIn(b"./assets/", body)
         status, headers, body = self.request("GET", "/api/state")
         self.assertEqual(status, 200)
         state = json.loads(body)
         out = io.StringIO()
-        with patch.object(sys, "argv", ["cs", "status", "--json"]), contextlib.redirect_stdout(out):
+        with patch.object(sys, "argv", ["cs", "status", "--json"]), contextlib.redirect_stdout(out), \
+                patch.dict(CLI["cmd_status"].__globals__, reclaim=Mock(return_value=0), write_board=Mock()):
             self.assertEqual(CLI["main"](), 0)
         expected = json.loads(out.getvalue())
         self.assertEqual({k: v for k, v in state.items() if k != "dashboard"}, expected)
@@ -121,15 +122,25 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(data["done"][0]["elapsed_seconds"], 180)
         self.assertEqual(data["done"][0]["exit"], 7)
 
-    def test_status_reclaims_but_never_schedules(self):
+    def test_snapshot_never_reclaims_locks_schedules_or_writes(self):
         self.record("dead", "running", pid=None)
         self.record("waiting", "queue")
-        with patch.object(core, "launch", side_effect=AssertionError("must not launch")):
-            state = json.loads(self.request("GET", "/api/state")[2])
-        self.assertEqual(state["reclaimed"], 1)
-        self.assertEqual(state["running"], [])
+        before = {str(p.relative_to(self.root)): p.read_bytes()
+                  for p in self.root.rglob("*") if p.is_file()}
+        forbidden = Mock(side_effect=AssertionError("dashboard must be read-only"))
+        with patch.object(core, "launch", forbidden), patch.object(core, "reclaim", forbidden), \
+                patch.object(core, "state_lock", forbidden), patch.object(core, "ensure", forbidden), \
+                patch.object(core, "write_board", forbidden), \
+                patch.object(core, "write_job", forbidden):
+            state = dashboard.snapshot(forbidden)
+        forbidden.assert_not_called()
+        self.assertEqual(state["reclaimed"], 0)
+        self.assertEqual(state["running"][0]["id"], "dead")
         self.assertEqual(state["queued"][0]["id"], "waiting")
-        self.assertEqual(state["dashboard"]["done"][0]["status"], "unknown")
+        self.assertEqual(state["dashboard"]["done"], [])
+        after = {str(p.relative_to(self.root)): p.read_bytes()
+                 for p in self.root.rglob("*") if p.is_file()}
+        self.assertEqual(before, after)
 
     def test_state_failure_returns_503(self):
         with patch.object(dashboard, "snapshot", side_effect=ValueError("broken")):
@@ -159,9 +170,117 @@ class DashboardTests(unittest.TestCase):
                         returncode=0, stdout="PID Status Label\n%s\t0\t%s\n" % (pid, dashboard.LABEL))) as run:
                     result = dashboard.launchd_state()
                     self.assertIs(result["running"], expected)
+                    self.assertIs(result["loaded"], True)
                     self.assertEqual(run.call_args[0][0], ["launchctl", "list"])
             with patch.object(dashboard.subprocess, "run", side_effect=FileNotFoundError):
                 self.assertIsNone(dashboard.launchd_state()["running"])
+                self.assertIsNone(dashboard.launchd_state()["loaded"])
+            with patch.object(dashboard.subprocess, "run", return_value=Mock(
+                    returncode=0, stdout="- 0 com.heggria.cs-tick-other\n")):
+                self.assertFalse(dashboard.launchd_state()["loaded"])
+
+    def test_iso_utc_z_timestamps_on_python39(self):
+        self.assertEqual(dashboard.timestamp("2026-10-16T08:00:00.000Z").timestamp(),
+                         dashboard.timestamp("2026-10-16T16:00:00+08:00").timestamp())
+        self.record("utc", "done", created_at="2026-10-16T07:59:00Z",
+                    started_at="2026-10-16T08:00:00Z", finished_at="2026-10-16T08:05:00Z")
+        self.assertEqual(dashboard.snapshot()["dashboard"]["completed"][0]["elapsed_seconds"], 300)
+
+    def test_static_assets_mime_head_and_traversal(self):
+        for asset in (dashboard.DIST / "assets").iterdir():
+            path = "/assets/" + asset.name
+            status, headers, body = self.request("GET", path)
+            self.assertEqual(status, 200)
+            self.assertEqual(body, asset.read_bytes())
+            self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+            expected = {".js": "text/javascript", ".css": "text/css"}[asset.suffix]
+            self.assertEqual(headers["Content-Type"], expected + "; charset=utf-8")
+            self.assertEqual(self.request("HEAD", path)[2], b"")
+        for path in ("/../dashboard.py", "/%2e%2e/dashboard.py", "/assets/%2e%2e/%2e%2e/core.py",
+                     "/%2e%2e%2fcore.py", "/assets/", "/missing.js", "/assets%5c..%5ccore.py", "/%00"):
+            with self.subTest(path=path):
+                self.assertEqual(self.request("GET", path)[0], 404)
+
+    def test_static_symlink_escape_and_mime_fallback(self):
+        dist = self.base / "dist"
+        dist.mkdir()
+        (dist / "leak.txt").symlink_to(REPO / "lib/core.py")
+        (dist / "icon.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg"/>')
+        (dist / "sample.bin").write_bytes(b"\x00\x01")
+        with patch.object(dashboard, "DIST", dist):
+            self.assertEqual(self.request("GET", "/leak.txt")[0], 404)
+            self.assertEqual(self.request("GET", "/icon.svg")[1]["Content-Type"], "image/svg+xml")
+            self.assertEqual(self.request("GET", "/sample.bin")[1]["Content-Type"],
+                             "application/octet-stream")
+
+    def test_tick_health_uses_loaded_not_running_and_three_minute_limit(self):
+        logs = self.root / "logs"
+        logs.mkdir()
+        log = logs / "tick.log"
+        log.write_text('{"started": []}\n')
+        for loaded, age, healthy in ((True, 0, True), (True, 180, True),
+                                     (True, 181, False), (False, 0, False), (None, 0, False)):
+            with self.subTest(loaded=loaded, age=age):
+                os.utime(log, (self.now.timestamp() - age, self.now.timestamp() - age))
+                with patch.object(dashboard, "launchd_state", return_value={
+                        "loaded": loaded, "running": False, "pid": None, "last_exit_status": 0}):
+                    data = dashboard.tick_state(self.root, self.now)
+                self.assertIs(data["healthy"], healthy)
+                self.assertEqual(data["age_seconds"], age)
+        log.unlink()
+        self.assertFalse(dashboard.tick_state(self.root, self.now)["healthy"])
+
+    def test_tick_fresh_errors_are_unhealthy(self):
+        logs = self.root / "logs"
+        logs.mkdir()
+        (logs / "tick.log").write_text('{"error": "failed"}\n')
+        self.assertFalse(dashboard.tick_state(self.root)["healthy"])
+        (logs / "tick.log").write_text('{"started": []}\n')
+        with patch.object(dashboard, "launchd_state", return_value={
+                "loaded": True, "running": False, "pid": None, "last_exit_status": 1}):
+            self.assertFalse(dashboard.tick_state(self.root)["healthy"])
+
+    def test_snapshot_cache_expires_after_two_seconds(self):
+        with patch.object(dashboard.time, "monotonic", side_effect=[100, 101.9, 102]), \
+                patch.object(dashboard, "snapshot", wraps=dashboard.snapshot) as read:
+            first = json.loads(self.request("GET", "/api/state")[2])
+            self.record("later", "queue")
+            self.assertEqual(json.loads(self.request("GET", "/api/state")[2]), first)
+            fresh = json.loads(self.request("GET", "/api/state")[2])
+            self.assertEqual(fresh["queued"][0]["id"], "later")
+            self.assertEqual(read.call_count, 2)
+
+    def test_lifecycle_includes_overlapping_jobs_and_all_completed(self):
+        self.record("overlap", "done", created_at=(self.now - timedelta(hours=27)).isoformat(),
+                    started_at=(self.now - timedelta(hours=26)).isoformat(),
+                    finished_at=(self.now - timedelta(hours=23)).isoformat())
+        self.record("old", "done", created_at=(self.now - timedelta(hours=27)).isoformat(),
+                    finished_at=(self.now - timedelta(hours=25)).isoformat())
+        self.record("queued", "queue", created_at=self.now.isoformat(),
+                    queue_reasons=[{"type": "lock", "job": "overlap", "mine": "a.py",
+                                    "theirs": "a.py", "kind": "shared"}])
+        self.record("running", "running", started_at=self.now.isoformat())
+        data = dashboard.snapshot()["dashboard"]
+        self.assertEqual({job["id"] for job in data["timeline"]}, {"overlap", "queued", "running"})
+        self.assertEqual({job["id"] for job in data["completed"]}, {"overlap", "old"})
+        self.assertEqual(data["queued"][0]["queue_reasons"][0]["job"], "overlap")
+
+    def test_missing_state_root_is_not_created(self):
+        missing = self.base / "missing"
+        with patch.dict(os.environ, CS_HOME=str(missing)):
+            self.assertEqual(dashboard.snapshot()["running"], [])
+        self.assertFalse(missing.exists())
+
+    def test_duplicate_transition_prefers_terminal_record_and_skips_partial_json(self):
+        self.record("transition", "queue")
+        self.record("transition", "running")
+        self.record("transition", "done", finished_at=self.now.isoformat())
+        (self.root / "queue/broken.json").write_text("{")
+        (self.root / "queue/invalid.json").write_text("[]")
+        data = dashboard.snapshot()
+        self.assertEqual(data["queued"], [])
+        self.assertEqual(data["running"], [])
+        self.assertEqual(data["dashboard"]["completed"][0]["id"], "transition")
 
     def test_cli_dispatch_does_not_hold_scheduler_lock(self):
         with patch.object(sys, "argv", ["cs", "dashboard", "--port", "0"]), \

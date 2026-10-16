@@ -308,6 +308,7 @@ def reclaim(root):
         job["finished_at"] = datetime.now(TZ).isoformat()
         write_job(root, "done", job)
         remove_job(root, "running", job["id"])
+        log_event(root, job)
         n += 1
     return n
 
@@ -544,44 +545,61 @@ def tick(root, resolver=None):
     return result
 
 
-def log_tick(root, result):
-    """One bounded line per tick; rotate redirected launchd stdout in place too."""
+def append_log(root, filename, line, env_prefix, redirected_stdout=False, whole_lines=False):
+    """Shared bounded rotation; preserve the inode for launchd's open stdout."""
     def limit(name, default, minimum):
         try:
             return max(minimum, int(os.environ.get(name, default)))
         except ValueError:
             return default
 
-    max_bytes = limit("CS_TICK_LOG_MAX_BYTES", 1024 * 1024, 256)
-    backups = limit("CS_TICK_LOG_BACKUPS", 3, 0)
-    path = root / "logs" / "tick.log"
+    max_bytes = limit(env_prefix + "_MAX_BYTES", 1024 * 1024, 256)
+    backups = limit(env_prefix + "_BACKUPS", 3, 0)
+    path = root / "logs" / filename
     path.parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps({"at": datetime.now(TZ).isoformat(), "reclaimed": result["reclaimed"],
-                       "started_count": len(result["started"]), "counts": result["counts"],
-                       "queued_count": len(result["queued"])}) + "\n"
     if path.exists() and path.stat().st_size + len(line.encode()) > max_bytes:
         # Remove backups above a reduced retention setting as well.
-        for old in path.parent.glob("tick.log.*"):
+        for old in path.parent.glob(filename + ".*"):
             if old.suffix[1:].isdigit() and int(old.suffix[1:]) > backups:
                 old.unlink()
         if backups:
             for number in range(backups, 1, -1):
-                previous = path.with_name("tick.log.%s" % (number - 1))
+                previous = path.with_name(filename + ".%s" % (number - 1))
                 if previous.exists():
-                    previous.replace(path.with_name("tick.log.%s" % number))
+                    previous.replace(path.with_name(filename + ".%s" % number))
             # Preserve the inode: launchd may already have stdout/stderr open.
-            with path.open("rb") as source, path.with_name("tick.log.1").open("wb") as target:
-                source.seek(max(0, path.stat().st_size - max_bytes))
+            with path.open("rb") as source, path.with_name(filename + ".1").open("wb") as target:
+                offset = max(0, path.stat().st_size - max_bytes)
+                source.seek(offset)
+                if whole_lines and offset:
+                    source.seek(offset - 1)
+                    if source.read(1) != b"\n":
+                        source.readline()  # Never leave a partial JSON object in a backup.
                 shutil.copyfileobj(source, target)
         with path.open("r+b") as handle:
             handle.truncate(0)
     try:
-        redirected = path.exists() and os.path.samestat(os.fstat(sys.stdout.fileno()), path.stat())
+        redirected = redirected_stdout and path.exists() and os.path.samestat(os.fstat(sys.stdout.fileno()), path.stat())
     except (AttributeError, OSError, ValueError):
         redirected = False
     if not redirected:
         with path.open("a") as handle:
             handle.write(line)
+
+
+def log_tick(root, result):
+    """One bounded line per tick, including when launchd redirects stdout."""
+    line = json.dumps({"at": datetime.now(TZ).isoformat(), "reclaimed": result["reclaimed"],
+                       "started_count": len(result["started"]), "counts": result["counts"],
+                       "queued_count": len(result["queued"])}) + "\n"
+    append_log(root, "tick.log", line, "CS_TICK_LOG", redirected_stdout=True)
+
+
+def log_event(root, job):
+    """Call once after a serialized terminal transition; no outcome mutation."""
+    from stats import job_event
+    line = json.dumps(job_event(job), ensure_ascii=False) + "\n"
+    append_log(root, "events.jsonl", line, "CS_EVENT_LOG", whole_lines=True)
 
 
 def write_board(root):

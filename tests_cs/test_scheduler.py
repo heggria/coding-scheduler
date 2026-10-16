@@ -78,6 +78,43 @@ class SchedulerTests(unittest.TestCase):
                     core.launch(self.root, job, "codex")
                 remote.assert_not_called()
 
+    def test_terminal_transitions_append_one_event_each(self):
+        for jid, exit_code, conclusion, expected in (
+                ("ok", "0", "STATUS: DONE", "done"),
+                ("block", "0", "STATUS: BLOCKED\n清单外文件", "blocked"),
+                ("fail", "1", "STATUS: DONE", "failed"),
+                ("unknown", "124", "STATUS: DONE", "unknown")):
+            self.submit(jid, "--prompt-text", "job " + jid, "--tick")
+            worker = core.remote_dir(jid)
+            (worker / "exit").write_text(exit_code)
+            (worker / "conclusion.md").write_text(conclusion)
+            core.reclaim(self.root)
+            self.assertEqual(core.find_job(self.root, jid)["status"], expected)
+        self.submit("cancel", "--prompt-text", "中文 cancel", "--tick")
+        (core.remote_dir("cancel") / "conclusion.md").write_text(" STATUS: DONE \n")
+        self.cli("cancel", "cancel", "--json")
+        events_path = self.root / "logs/events.jsonl"
+        before = events_path.read_bytes()
+        self.assertEqual(core.reclaim(self.root), 0)
+        self.cli("cancel", "cancel", "--json", expected=1)
+        self.assertEqual(events_path.read_bytes(), before)
+        events = [json.loads(line) for line in before.splitlines()]
+        self.assertEqual([e["status"] for e in events], ["done", "blocked", "failed", "unknown", "cancelled"])
+        self.assertEqual(events[1]["blocked_reason_class"], "files_narrow")
+        self.assertTrue(events[-1]["cancelled_after_done"])
+        for event in events:
+            self.assertGreater(event["prompt_bytes"], 0)
+            self.assertIsNotNone(event["elapsed_s"])
+            self.assertEqual(event["project"], "fixture")
+
+    def test_queued_cancel_event_preserves_reason_observation(self):
+        self.submit("cancel-queued", "--prompt-text", "cancel")
+        self.cli("cancel", "cancel-queued", "--json")
+        event = json.loads((self.root / "logs/events.jsonl").read_text())
+        self.assertEqual(event["queue_reason_types"], ["awaiting_tick"])
+        self.assertIsNone(event["elapsed_s"])
+        self.assertFalse(event["cancelled_after_done"])
+
     def test_pool_choice_and_all_spill_reasons(self):
         self.assertEqual(pick_pool(90, 40, 1, 1), ("codex", []))
         self.assertEqual(pick_pool(90, 50, 0, 1), ("cc", []))

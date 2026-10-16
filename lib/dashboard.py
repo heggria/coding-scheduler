@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from affinity import model_for
 import core
+from stats import collect_stats
 from core import TZ, counts, home, load_jobs, reason_text, remote_dir
 
 TAIL_BYTES = 8192
@@ -255,6 +256,21 @@ def make_server(host, port, status_command=None):
                                      "application/json; charset=utf-8")
                     return
                 path = unquote(parts.path)
+                if path == "/api/stats":
+                    try:
+                        query = parse_qs(parts.query, keep_blank_values=True)
+                        if any(len(values) != 1 for values in query.values()):
+                            raise ValueError("duplicate query parameter")
+                        result = collect_stats(home(), query.get("since", ["2h"])[0],
+                                               query.get("project", [None])[0],
+                                               query.get("pool", [None])[0])
+                    except ValueError as error:
+                        self.respond(400, json.dumps({"error": str(error)}).encode("utf-8"),
+                                     "application/json; charset=utf-8")
+                        return
+                    self.respond(200, json.dumps(result, ensure_ascii=False).encode("utf-8"),
+                                 "application/json; charset=utf-8")
+                    return
                 if path == "/api/state":
                     current = time.monotonic()
                     if cached["at"] is None or current - cached["at"] >= CACHE_SECONDS:

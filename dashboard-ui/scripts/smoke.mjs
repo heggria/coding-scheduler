@@ -49,6 +49,23 @@ const done = [
   elapsed_seconds: 720,
 }));
 const completed = done;
+let statsMode = "normal";
+let statsHits = 0;
+const statsGroup = (total, ok, blocked, cancelled, failed = 0) => ({
+  total, success_rate: total ? ok / total : null,
+  distribution: { done: ok, blocked, cancelled, failed, unknown: 0 },
+  elapsed_s: { avg: total ? 120 : null, p50: total ? 60 : null, p95: total ? 300 : null, samples: total },
+  mean_prompt_bytes: total ? 4096 : null, cancelled_after_done: cancelled ? 1 : 0,
+});
+const statsBody = () => JSON.stringify({
+  schema_version: "1", since: iso(120), until: iso(0),
+  ...(statsMode === "empty" ? statsGroup(0, 0, 0, 0) : statsGroup(5, 2, 1, 1, 1)),
+  by_pool: {
+    codex: statsMode === "empty" ? statsGroup(0, 0, 0, 0) : statsGroup(2, 1, 1, 0),
+    cc: statsMode === "empty" ? statsGroup(0, 0, 0, 0) : statsGroup(2, 1, 0, 1),
+    opencode: statsMode === "empty" ? statsGroup(0, 0, 0, 0) : statsGroup(1, 0, 0, 0, 1),
+  },
+});
 const stateBody = () =>
   JSON.stringify({
     schema_version: "1",
@@ -89,6 +106,13 @@ const server = createServer(async (req, res) => {
   };
   if (req.method !== "GET") return send(405, "", "text/plain");
   if (url.pathname === "/api/state") return send(200, stateBody(), "application/json");
+  if (url.pathname === "/api/stats") {
+    statsHits++;
+    assert.equal(url.searchParams.get("since"), "2h");
+    return statsMode === "error"
+      ? send(503, '{"error":"fixture unavailable"}', "application/json")
+      : send(200, statsBody(), "application/json");
+  }
   const m = url.pathname.match(/^\/api\/jobs\/([^/]+)\/log$/);
   if (m) {
     const payload = logBody(decodeURIComponent(m[1]));
@@ -126,7 +150,7 @@ try {
   page.on("pageerror", (e) => diagnostics.push(e.message));
   page.on("console", (m) => {
     // The fixture intentionally answers 404 for the queued job's log.
-    if (m.type() === "error" && !m.text().includes("404")) diagnostics.push(m.text());
+    if (m.type() === "error" && !/404|503/.test(m.text())) diagnostics.push(m.text());
   });
   page.on("dialog", (d) => {
     diagnostics.push(`Unexpected dialog: ${d.type()}`);
@@ -152,6 +176,25 @@ try {
   assert.match(await page.getByTestId("metric-queued").textContent(), /文件锁冲突/);
   assert.match(await page.getByTestId("metric-done").textContent(), /2/);
   step("metrics bar + pool slots");
+
+  const stats = page.getByTestId("stats-panel");
+  await stats.waitFor();
+  await page.waitForFunction(() => document.querySelector('[data-testid="stats-success-rate"]')?.textContent === "40.0%");
+  assert.match(await stats.getByTestId("stats-distribution").textContent(), /成功 2 · 受阻 1 · 取消 1 · 失败 1 · 未知 0/);
+  assert.match(await stats.getByTestId("stats-latency").textContent(), /P50.*P95/);
+  assert.match(await stats.getByTestId("stats-pool-codex").textContent(), /50.0%/);
+  assert.match(await stats.getByTestId("stats-pool-cc").textContent(), /50.0%/);
+  assert.match(await stats.getByTestId("stats-pool-opencode").textContent(), /0.0%/);
+  statsMode = "error";
+  await page.waitForFunction(() => document.querySelector('[data-testid="stats-health"]')?.textContent.includes("显示旧数据"));
+  assert.equal(await stats.getByTestId("stats-success-rate").textContent(), "40.0%");
+  statsMode = "empty";
+  await page.waitForFunction(() => document.querySelector('[data-testid="stats-panel"]')?.textContent.includes("窗口内无终态"));
+  assert.equal(await stats.getByTestId("stats-success-rate").textContent(), "—");
+  statsMode = "normal";
+  await page.waitForFunction(() => document.querySelector('[data-testid="stats-success-rate"]')?.textContent === "40.0%");
+  assert.ok(statsHits >= 4, "stats endpoint is polled and recovers independently");
+  step("2h stats: distribution, pools, polling, stale error, empty, recovery");
 
   // job table: running + queued, default selection = oldest running job
   assert.equal(await page.locator('[data-testid^="job-row-"]').count(), 5);
@@ -242,6 +285,7 @@ try {
   await page.getByTestId("job-inspector").waitFor({ state: "detached" }); // no inline inspector below 900px
   assert.equal(await page.getByTestId("inspector-drawer").count(), 0, "drawer closed until a row is selected");
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  assert.ok((await page.getByTestId("stats-panel").boundingBox()).width <= 800);
   await row("q-lock").click();
   const drawer = page.getByTestId("inspector-drawer");
   await drawer.waitFor();

@@ -221,11 +221,13 @@ def cmd_cancel(args):
             pgid = job.get("pgid") or job.get("pid")
             job.update(kill_worker_group(pgid) if pgid else
                        {"cancel_killed_pids": [], "cancel_signal": None})
+        queue_reasons = job.get("queue_reasons", [])
         job.update(status="cancelled", finished_at=datetime.now(TZ).isoformat(), queue_reasons=[])
         if args.superseded_by:
             job["superseded_by"] = args.superseded_by
         write_job(root, "done", job)
         remove_job(root, folder, args.id)
+        core.log_event(root, dict(job, queue_reasons=queue_reasons))
         write_board(root)
         if args.json:
             emit({"job": job_summary(job), "superseded_by": args.superseded_by})
@@ -260,6 +262,13 @@ def cmd_doctor(args):
 def cmd_dashboard(args):
     from dashboard import serve
     return serve(args, cmd_status)
+
+
+def cmd_stats(args):
+    from stats import collect_stats, format_stats
+    result = collect_stats(home(), args.since, args.project, args.pool)
+    print(json.dumps(result, ensure_ascii=False) if args.json else format_stats(result))
+    return 0
 
 
 class Parser(argparse.ArgumentParser):
@@ -319,15 +328,20 @@ def main():
     d.add_argument("--cwd", default=None)
     d.add_argument("--pool", choices=["codex", "cc", "opencode"], default=None, help="required worker CLI; other CLI checks only warn")
     d.set_defaults(func=cmd_doctor)
+    stats = sp.add_parser("stats", help="read terminal-job statistics without changing state")
+    stats.add_argument("--since", default="2h", help="duration (2h/30m/1d) or ISO timestamp")
+    stats.add_argument("--project", default=None)
+    stats.add_argument("--pool", choices=["codex", "cc", "opencode"], default=None)
+    stats.set_defaults(func=cmd_stats)
     dashboard = sp.add_parser("dashboard", help="serve the read-only live dashboard")
     dashboard.add_argument("--host", default="127.0.0.1")
     dashboard.add_argument("--port", type=int, default=8787)
     dashboard.set_defaults(func=cmd_dashboard)
-    for parser in (s, t, st, w, c, b, d):
+    for parser in (s, t, st, w, c, b, d, stats):
         parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     args = ap.parse_args()
     try:
-        if args.cmd in ("wait", "dashboard") or (args.cmd == "status" and args.no_reclaim):
+        if args.cmd in ("wait", "dashboard", "stats") or (args.cmd == "status" and args.no_reclaim):
             return args.func(args)
         with state_lock(ensure()):
             return args.func(args)

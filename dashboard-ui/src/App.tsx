@@ -35,6 +35,7 @@ import {
   type HeatCell,
 } from "@/lib/derive";
 import { MetricsBar } from "@/components/dashboard/MetricsBar";
+import { StatsPanel } from "@/components/dashboard/StatsPanel";
 import { JobTable } from "@/components/dashboard/JobTable";
 import { JobInspector } from "@/components/dashboard/JobInspector";
 import { ActivityHeatmap } from "@/components/dashboard/ActivityHeatmap";
@@ -456,6 +457,7 @@ export default function App() {
             </div>
           )}
           <MetricsBar state={state} snap={snap} poolFilter={pool} onPool={setPool} />
+          <StatsPanel />
           <div className="workgrid">
             <div className="workcol">
               <section className="panel explorer">

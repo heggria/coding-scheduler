@@ -74,6 +74,30 @@ launchd 将 stdout 追加重定向到同一 tick.log 时只记 stdout 一份，�
 目录锁按解析后的目录在每单提交时只警告一次，tick 不重复警告；
 锁原因按占用 job、当前文件和 kind 去重，board 对历史重复原因也只显示一次。
 
+## 执行统计与只读看板
+
+```bash
+cs stats                         # 默认近 2h，按 finished_at 计入全部终态
+cs stats --since 30m --project cs --pool codex --json
+cs stats --since 2026-10-17T00:00:00+08:00
+cs dashboard                     # 默认 http://127.0.0.1:8787
+```
+
+成功率 = done / (done + blocked + failed + unknown + cancelled)，空窗口返回 null；
+耗时 avg/p50/p95 使用所有有 started_at/finished_at 的终态，百分位采用 nearest-rank。
+同时输出状态分布、按池/项目分组、平均 prompt 字节数（缺失不计样本）。JSON 版本为 `"1"`。
+`--since` 接受整数 m/h/d 或 ISO 时间；不带时区的 ISO 按 UTC+8 解释。
+
+回收和取消时向 `{CS_HOME}/logs/events.jsonl` 追加一条终态事件，不改既有结果判定。
+默认 1 MiB / 3 份备份，环境变量 `CS_EVENT_LOG_MAX_BYTES`（最小 256）、
+`CS_EVENT_LOG_BACKUPS`（可为 0）控制轮转，事件备份只保留完整 JSON 行。
+统计优先读取当前与轮转事件，对缺失 ID 扫描 done/*.json 只读补齐，按 ID 去重；
+不会迁移旧记录、回填事件文件、回收任务、创建状态目录或锁文件。
+
+看板新增近 2h 全局成功率、受阻/取消、耗时与三池切片，独立轮询只读
+`GET /api/stats?since=2h`；API 同样支持 project/pool 过滤，非法 since 返回 400。
+统计请求失败时明确显示旧数据/不可用，空窗口显示「—」，不会伪装成 0% 成功率。
+
 ## 池上限（caps）
 
 Codex/CC/OpenCode 并发上限默认 24/6/32，运行时读取 `{CS_HOME}/caps.json`（`{"codex":24,"cc":6,"opencode":32}`，正整数），

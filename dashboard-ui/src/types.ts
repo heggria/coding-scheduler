@@ -1,6 +1,20 @@
 // Contract for GET /api/state (lib/dashboard.py, schema_version "1").
 // Every job field is optional: old job records may predate any of them.
 export type Pool = "codex" | "cc" | "opencode";
+export interface StatsGroup {
+  total: number;
+  success_rate: number | null;
+  distribution: Record<"done" | "blocked" | "failed" | "unknown" | "cancelled", number>;
+  elapsed_s: { avg: number | null; p50: number | null; p95: number | null; samples: number };
+  mean_prompt_bytes: number | null;
+  cancelled_after_done: number;
+}
+export interface Stats extends StatsGroup {
+  schema_version: "1";
+  since: string;
+  until: string;
+  by_pool: Record<Pool, StatsGroup>;
+}
 export interface Reason {
   type: string;
   pool?: string;

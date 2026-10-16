@@ -89,7 +89,7 @@ class DashboardTests(unittest.TestCase):
         self.assertGreaterEqual(state["dashboard"]["running"][0]["elapsed_seconds"], 120)
 
     def test_head_and_all_other_methods(self):
-        for path in ("/", "/api/state"):
+        for path in ("/", "/api/state", "/api/stats?since=2h"):
             status, headers, body = self.request("HEAD", path)
             self.assertEqual(status, 200)
             self.assertGreater(int(headers["Content-Length"]), 0)
@@ -100,6 +100,28 @@ class DashboardTests(unittest.TestCase):
                 self.assertEqual(status, 405)
                 self.assertEqual(headers["Allow"], "GET, HEAD")
         self.assertEqual(self.request("GET", "/missing")[0], 404)
+
+    def test_stats_read_only_filters_validation_and_backfill(self):
+        self.record("recent", "done", finished_at=(self.now - timedelta(minutes=1)).isoformat(),
+                    started_at=(self.now - timedelta(minutes=3)).isoformat())
+        self.record("blocked", "done", status="blocked", pool="cc", project="od",
+                    finished_at=(self.now - timedelta(minutes=5)).isoformat())
+        self.record("old", "done", finished_at=(self.now - timedelta(hours=3)).isoformat())
+        self.record("still-live", "running", pid=-1)
+        before = {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+        status, _, body = self.request("GET", "/api/stats?since=2h")
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertEqual(result["schema_version"], "1")
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(result["success_rate"], .5)
+        self.assertEqual(result["elapsed_s"]["p95"], 120)
+        status, _, body = self.request("GET", "/api/stats?since=30m&project=od&pool=cc")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["distribution"]["blocked"], 1)
+        for query in ("since=bad", "since=", "since=2h&since=1d"):
+            self.assertEqual(self.request("GET", "/api/stats?" + query)[0], 400)
+        self.assertEqual(before, {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()})
 
     def test_presentation_recent_jobs_dedup_and_bounded_log_tail(self):
         self.record("live", "running", pid=os.getpid(), model="custom-model")

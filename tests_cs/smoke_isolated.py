@@ -23,7 +23,7 @@ def main():
     archive = root / "inherited-snapshot"
     archive.mkdir(exist_ok=True)
     # Never schedule or signal copied production jobs/PIDs. Only fresh fake jobs.
-    for name in ("queue", "running", "done", "quota.json"):
+    for name in ("queue", "running", "done", "quota.json", "logs"):
         path = root / name
         if path.exists():
             path.rename(archive / name)
@@ -66,6 +66,12 @@ def main():
     assert second["job"]["status"] == "queued"
     assert cs("wait", "wait-tick", "--tick", "--timeout", "5")["jobs"][0]["status"] == "done"
     board = Path(cs("board")["path"])
+    stats = cs("stats", "--since", "2h", "--project", "cs")
+    assert stats["total"] == 2 and stats["success_rate"] == 1
+    assert stats["distribution"]["done"] == 2
+    events = [json.loads(line) for line in (root / "logs/events.jsonl").read_text().splitlines()]
+    assert len(events) == 2 and {e["id"] for e in events} == {jid, "wait-tick"}
+    assert all(e["prompt_bytes"] > 0 for e in events)
     assert "原因" in board.read_text()
     assert (root / "workers" / jid / "log").read_text() == "test fake worker\n"
     assert board == root / "board.md"

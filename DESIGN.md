@@ -13,6 +13,7 @@ cs status [<id>] [--json]
 cs wait <id> [<id>...] [--tick] [--timeout SEC] [--lines N]
 cs cancel <id>
 cs board
+cs stats [--since 2h|30m|1d|ISO] [--project NAME] [--pool codex|cc|opencode] [--json]
 cs doctor
 ```
 
@@ -137,6 +138,41 @@ CS_TICK_LOG_MAX_BYTES 默认 1048576（最小 256），CS_TICK_LOG_BACKUPS 默�
 无快照保持旧行为；有快照时选中池的 0 / null或缺失分别对应耗尽 / 未知，阻止启动。
 容量无可选池时报告所有亲和度合格池的额度问题，以免池满隐藏额度原因。
 不自动刷新/扣减，不新增因额度而 spill 的策略。无远端真实额度验收声明。
+
+### 终态观测与统计（2026-10-17）
+
+实现边界以本次 observability 验收为准：E1 只观测终态，S1 只读统计，U1 近 2h 全局面板；
+不新增调度、自动续跑或结果重分类。`reclaim` 的 running→done 与 `cancel` 的 queue/running→done
+在原状态锁内调用 `log_event`，正常状态转换各追加一行 `logs/events.jsonl`，重复回收/取消不会重复记。
+取消仍清空任务内 queue_reasons，事件保留取消前的原因类型；prompt 先沿用现有归档，再取字节数。
+
+事件字段：at（finished_at）、id、project、pool、area、tier、status、exit、elapsed_s、
+prompt_bytes、queue_reason_types（唯一 type 列表）、blocked_reason_class、cancelled_after_done。
+未启动或缺时间的 elapsed_s 为 null；缺 prompt 文件的 prompt_bytes 为 null。
+blocked_reason_class 仅为 blocked 提供粗分类 files_narrow/read_only_write/soft_block/bad_input/other，
+基于结论与任务字段启发式，不改变 status；其余状态为 null。
+cancelled_after_done 仅在 cancelled 且结论 strip 后存在精确独立行 STATUS: DONE 时为 true。
+
+`append_log` 与 tick.log 共享大小/备份轮转，events 默认 1048576 字节 / 3 份，
+用 CS_EVENT_LOG_MAX_BYTES（最小 256）及 CS_EVENT_LOG_BACKUPS（最小 0）配置。
+当前文件追加；轮转保留 inode、完整 JSON 行，单条事件不切断（单条过大时可能超过大小上限）。
+状态 JSON 与日志不是跨文件事务；意外退出或磁盘写失败可能留下事件空缺，done 记录用于补齐统计。
+
+`lib/stats.py` 的 collect_stats 读取当前及数字后缀备份，最新事件优先、按 ID 去重；
+缺失 ID 从 done/*.json 只读补齐，不写历史日志或 job。忽略损坏/半写事件和非法/缺失结束时间；
+窗口为 since ≤ finished_at ≤ now，不将运行中任务计入分母。轮转/状态并发读取为 best-effort 快照。
+成功率 done / 全部五种终态；全部有效终态耗时用于 avg/p50/p95（nearest-rank），
+有效 prompt_bytes 用于均值；空样本为 null。by_pool 固定三池（无样本仍返回空组），by_project 按实际项目分组。
+--since 默认 2h，可用非负整数 m/h/d 或 ISO（无时区按 UTC+8）；--project/--pool 精确过滤。
+
+`cs stats` 无 ensure/state_lock/reclaim；`GET /api/stats?since=2h[&project=...&pool=...]`
+复用同一版本 1 JSON，GET/HEAD 只读、无状态写入，参数错误返回 400，其他方法 405。
+StatsPanel 以 4s（隐藏页 15s）独立轮询，10s 超时，不受任务表筛选影响；
+展示成功率、五种状态、取消前已 DONE、耗时、prompt 均值、三池切片；空窗口/失败/旧数据分别显示。
+
+验证映射：E1 → test_scheduler 终态追加/重复动作 + test_stats 轮转；
+S1 → test_stats 窗口/去重/补齐/过滤/分位数/只读 CLI + test_dashboard API/HEAD/参数/只读；
+U1 → scripts/smoke.mjs 数值、三池、轮询、空态、错误恢复与窄屏；smoke_isolated 走假 worker 全链路。
 
 ### 摘要与模板
 

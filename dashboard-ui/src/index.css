@@ -420,7 +420,7 @@ button.heat-cell:not(:disabled):hover { outline: 1px solid var(--text); }
   .topbar { padding: 0 14px; }
   .body { padding: 12px 14px; }
   .crumb span:not(.badge), .crumb .slash { display: none; }
-  .c-area, .c-pool { width: 0; }
+  .c-area, .c-pool { display: none; } /* drop the <col>s together with their cells */
   .job-table th:nth-child(3), .job-table td:nth-child(3),
   .job-table th:nth-child(4), .job-table td:nth-child(4) { display: none; }
 }
@@ -428,6 +428,7 @@ button.heat-cell:not(:disabled):hover { outline: 1px solid var(--text); }
   .metric-strip { grid-template-columns: 1fr; }
   .metric { border-right: 0; border-bottom: 1px solid var(--border); }
   .statusline .api, .statusline .mono { display: none; }
+  .c-project, .c-signal { display: none; }
   .job-table th:nth-child(2), .job-table td:nth-child(2),
   .job-table th:nth-child(7), .job-table td:nth-child(7) { display: none; }
   .job-table td { height: 44px; }
@@ -435,3 +436,11 @@ button.heat-cell:not(:disabled):hover { outline: 1px solid var(--text); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
+
+/* ---------- log viewer & narrow drawer ---------- */
+.log-viewer { display: flex; flex-direction: column; gap: 2px; }
+.log-viewer section { margin-top: 6px; }
+.log-pre.log-full { max-height: 280px; font: 10.5px/1.5 var(--mono); }
+.inspector-drawer { overflow-y: auto; padding: 0; background: var(--bg); }
+.inspector-drawer .inspector { max-height: none; min-height: 100%; border-radius: 0; border-width: 0; border-top-width: 2px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }

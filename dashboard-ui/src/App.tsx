@@ -12,6 +12,7 @@ import {
   X,
 } from "lucide-react";
 import { Input } from "@/components/ui/input";
+import { Sheet, SheetContent, SheetDescription, SheetTitle } from "@/components/ui/sheet";
 import {
   Select,
   SelectContent,
@@ -70,6 +71,18 @@ function readParams() {
     job: p.get("job"),
   };
 }
+const NARROW_QUERY = "(max-width: 899px)";
+function useNarrow() {
+  const [narrow, setNarrow] = useState(() => window.matchMedia(NARROW_QUERY).matches);
+  useEffect(() => {
+    const media = window.matchMedia(NARROW_QUERY);
+    const onChange = () => setNarrow(media.matches);
+    onChange();
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, []);
+  return narrow;
+}
 function stored(key: string): string | null {
   try {
     return localStorage.getItem(key);
@@ -99,6 +112,10 @@ export default function App() {
   const [q, setQ] = useState(initial.q);
   const [selectedId, setSelectedId] = useState<string | null>(initial.job);
   const [closed, setClosed] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const narrow = useNarrow();
+  // The drawer opens only from a row selection made at the current breakpoint.
+  useEffect(() => setDrawerOpen(false), [narrow]);
   const [page, setPage] = useState(0);
   const [heatPick, setHeatPick] = useState<HeatCell | null>(null);
   const [flash, setFlash] = useState<{ ids: Set<string>; phase: number }>({ ids: new Set(), phase: 0 });
@@ -263,6 +280,7 @@ export default function App() {
   const selectedRow = selectedId ? snap.byId.get(selectedId) || null : null;
   const select = (id: string) => {
     setClosed(false);
+    setDrawerOpen(true);
     setSelectedId(id);
   };
   const jump = (id: string) => {
@@ -324,8 +342,26 @@ export default function App() {
     <div className="empty-note">当前记录中没有此类任务。</div>
   );
 
+  const inspector = (
+    <JobInspector
+      key={selectedId || "none"}
+      row={selectedRow}
+      missingId={state && selectedId && !selectedRow ? selectedId : null}
+      now={liveNow}
+      drift={drift}
+      exists={(id) => snap.byId.has(id)}
+      onJump={jump}
+      onClose={() => {
+        setClosed(true);
+        setDrawerOpen(false);
+        setSelectedId(null);
+      }}
+      counts={state?.counts}
+    />
+  );
+
   return (
-    <div className={cn("shell", density === "compact" && "compact")}>
+    <div className={cn("shell", density === "compact" && "compact")} data-density={density}>
       <nav className="rail" aria-label="视图">
         <span className="logo">cs</span>
         <button
@@ -370,6 +406,7 @@ export default function App() {
             <button
               type="button"
               className="icon-btn"
+              data-testid="density-toggle"
               aria-label={density === "compact" ? "切换为舒适密度" : "切换为紧凑密度"}
               title={density === "compact" ? "舒适密度" : "紧凑密度"}
               onClick={() => setDensity(density === "compact" ? "comfortable" : "compact")}
@@ -393,10 +430,15 @@ export default function App() {
               <h1>每一单的现场，一眼可见。</h1>
             </div>
             <div className="seg" role="group" aria-label="视图切换">
-              <button type="button" aria-pressed={view === "work"} onClick={() => setView("work")}>
+              <button type="button" data-testid="view-work" aria-pressed={view === "work"} onClick={() => setView("work")}>
                 工作台
               </button>
-              <button type="button" aria-pressed={view === "timeline"} onClick={() => setView("timeline")}>
+              <button
+                type="button"
+                data-testid="view-timeline"
+                aria-pressed={view === "timeline"}
+                onClick={() => setView("timeline")}
+              >
                 执行分析
               </button>
             </div>
@@ -529,33 +571,32 @@ export default function App() {
               </section>
               {view === "work" && <ActivityHeatmap heat={heat} picked={heatPick} onPick={pickHeat} />}
             </div>
-            <AnimatePresence mode="wait" initial={false}>
-              <motion.div
-                key={selectedId || "none"}
-                className="inspector-wrap"
-                initial={{ opacity: 0, x: 8 }}
-                animate={{ opacity: 1, x: 0 }}
-                exit={{ opacity: 0 }}
-                transition={{ duration: 0.16 }}
-              >
-                <JobInspector
-                  row={selectedRow}
-                  missingId={state && selectedId && !selectedRow ? selectedId : null}
-                  now={liveNow}
-                  drift={drift}
-                  exists={(id) => snap.byId.has(id)}
-                  onJump={jump}
-                  onClose={() => {
-                    setClosed(true);
-                    setSelectedId(null);
-                  }}
-                  counts={state?.counts}
-                />
-              </motion.div>
-            </AnimatePresence>
+            {!narrow && (
+              <AnimatePresence mode="wait" initial={false}>
+                <motion.div
+                  key={selectedId || "none"}
+                  className="inspector-wrap"
+                  initial={{ opacity: 0, x: 8 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.16 }}
+                >
+                  {inspector}
+                </motion.div>
+              </AnimatePresence>
+            )}
           </div>
         </main>
       </div>
+      {narrow && (
+        <Sheet open={drawerOpen && !!selectedId} onOpenChange={setDrawerOpen}>
+          <SheetContent side="right" className="inspector-drawer" data-testid="inspector-drawer">
+            <SheetTitle className="sr-only">任务详情</SheetTitle>
+            <SheetDescription className="sr-only">所选任务的概览、日志与排队原因（只读）</SheetDescription>
+            {inspector}
+          </SheetContent>
+        </Sheet>
+      )}
     </div>
   );
 }

@@ -230,6 +230,98 @@ class DashboardTests(unittest.TestCase):
         log.unlink()
         self.assertFalse(dashboard.tick_state(self.root, self.now)["healthy"])
 
+    def worker_dir(self, jid):
+        directory = core.remote_dir(jid)
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def log_request(self, jid, query=""):
+        status, headers, body = self.request("GET", "/api/jobs/%s/log%s" % (jid, query))
+        return status, headers, body
+
+    def test_job_log_endpoint_returns_tails(self):
+        directory = self.worker_dir("job-1.a_b")
+        (directory / "log").write_text("".join("line %d\n" % i for i in range(500)))
+        (directory / "worker.log").write_text("only\n")
+        (directory / "stderr").write_text("err1\nerr2\n")
+        (directory / "conclusion.md").write_text("# done\n")
+        (directory / "secret.txt").write_text("nope")
+        status, headers, body = self.log_request("job-1.a_b")
+        self.assertEqual(status, 200)
+        self.assertIn("application/json", headers["Content-Type"])
+        data = json.loads(body)
+        self.assertEqual(data["id"], "job-1.a_b")
+        self.assertEqual(set(data["files"]), {"log", "worker.log", "stderr", "conclusion.md"})
+        lines = data["files"]["log"].split("\n")
+        self.assertEqual((len(lines), lines[0], lines[-1]), (200, "line 300", "line 499"))
+        self.assertEqual(data["files"]["conclusion.md"], "# done")
+        data = json.loads(self.log_request("job-1.a_b", "?tail=3")[2])
+        self.assertEqual(data["files"]["log"], "line 497\nline 498\nline 499")
+        self.assertEqual(self.request("HEAD", "/api/jobs/job-1.a_b/log")[0], 200)
+        self.assertEqual(self.request("POST", "/api/jobs/job-1.a_b/log")[0], 405)
+
+    def test_job_log_tail_bounds(self):
+        directory = self.worker_dir("bounds")
+        (directory / "log").write_text("".join("l%d\n" % i for i in range(3000)))
+        data = json.loads(self.log_request("bounds", "?tail=2000")[2])
+        self.assertEqual(len(data["files"]["log"].split("\n")), 2000)
+        self.assertEqual(json.loads(self.log_request("bounds", "?tail=1")[2])["files"]["log"], "l2999")
+        for query in ("?tail=0", "?tail=2001", "?tail=-1", "?tail=abc", "?tail=", "?tail=1.5",
+                      "?tail=1&tail=2", "?tail=99999999999999999999"):
+            with self.subTest(query=query):
+                self.assertEqual(self.log_request("bounds", query)[0], 400)
+
+    def test_job_log_caps_bytes_per_file(self):
+        directory = self.worker_dir("big")
+        cap = dashboard.LOG_FILE_BYTES
+        (directory / "log").write_bytes(b"head-marker\n" + b"x" * (cap * 3) + b"\nlast line\n")
+        text = json.loads(self.log_request("big", "?tail=2000")[2])["files"]["log"]
+        self.assertLessEqual(len(text.encode()), cap)
+        self.assertTrue(text.endswith("last line"))
+        self.assertNotIn("head-marker", text)
+
+    def test_job_log_missing_job_and_bad_ids(self):
+        self.assertEqual(self.log_request("nothing")[0], 404)
+        self.assertEqual(self.log_request("a" * 129)[0], 400)
+        for jid in ("%2e%2e", "%2E%2E", "..", "a..b", ".hidden", "-x", "a%2Fb", "%2Fetc%2Fpasswd",
+                    "..%2F..%2Fetc", "a%5Cb", "a%00b", "a%20b", "%2e%2e%2f%2e%2e%2fetc"):
+            with self.subTest(jid=jid):
+                status = self.log_request(jid)[0]
+                self.assertIn(status, (400, 404))
+                self.assertNotEqual(status, 200)
+        for path in ("/api/jobs/../state/log", "/api/jobs//etc/passwd/log", "/api/jobs/x/y/log",
+                     "/api/jobs/x", "/api/jobs/"):
+            with self.subTest(path=path):
+                self.assertEqual(self.request("GET", path)[0], 404)
+        self.assertEqual(self.log_request("%2e%2e")[0], 400)
+        self.assertEqual(self.log_request("%2Fetc%2Fpasswd")[0], 400)
+
+    def test_job_log_symlink_escape_is_not_followed(self):
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "log").write_text("TOP-SECRET\n")
+        workers = core.remote_dir("x").parent
+        workers.mkdir(parents=True, exist_ok=True)
+        (workers / "linked").symlink_to(outside, target_is_directory=True)
+        status, _, body = self.log_request("linked")
+        self.assertEqual(status, 404)
+        self.assertNotIn(b"TOP-SECRET", body)
+        directory = self.worker_dir("filelink")
+        (directory / "log").symlink_to(outside / "log")
+        (directory / "stderr").write_text("fine\n")
+        status, _, body = self.log_request("filelink")
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"TOP-SECRET", body)
+        self.assertEqual(json.loads(body)["files"], {"stderr": "fine"})
+
+    def test_job_log_endpoint_does_not_write(self):
+        self.worker_dir("ro")
+        (core.remote_dir("ro") / "log").write_text("x\n")
+        before = {str(p): p.stat().st_mtime_ns for p in self.base.rglob("*")}
+        self.log_request("ro")
+        self.log_request("missing")
+        self.assertEqual(before, {str(p): p.stat().st_mtime_ns for p in self.base.rglob("*")})
+
     def test_tick_fresh_errors_are_unhealthy(self):
         logs = self.root / "logs"
         logs.mkdir()

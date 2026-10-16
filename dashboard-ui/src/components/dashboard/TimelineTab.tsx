@@ -54,7 +54,7 @@ export function TimelineTab({
   const step = win === "60m" ? 600000 : 3 * 3600000;
   const ticks = Array.from({ length: Math.floor(span / step) + 1 }, (_, i) => start + i * step);
   return (
-    <div className="timeline">
+    <div className="timeline" data-testid="timeline-tab">
       <div className="toolbar">
         <div className="seg" role="group" aria-label="时间窗口">
           {(Object.keys(WINDOWS) as Win[]).map((w) => (
@@ -100,6 +100,7 @@ export function TimelineTab({
                 <button
                   key={j.id}
                   type="button"
+                  data-testid={`tl-row-${j.id}`}
                   className={cn("tl-row", selectedId === j.id && "selected")}
                   onClick={() => onSelect(j.id)}
                   title={`${j.id} · ${STATUS_LABEL[row.kind]}\n创建 ${clock(j.created_at, true)} · 启动 ${clock(j.started_at)} · 结束 ${clock(j.finished_at)}`}

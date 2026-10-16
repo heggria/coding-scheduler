@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Copy, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -61,6 +61,103 @@ function Files({ label, files }: { label: string; files: string[] }) {
   );
 }
 
+const LOG_POLL_MS = 3000;
+const LOG_TAIL = 200;
+interface LogPayload {
+  id: string;
+  files: Record<string, string>;
+}
+
+/** Read-only log tails from /api/jobs/<id>/log; polls only while the job runs. */
+function LogViewer({ id, running, fallback }: { id: string; running: boolean; fallback?: string | null }) {
+  const [data, setData] = useState<LogPayload | null>(null);
+  const [error, setError] = useState("");
+  const [updated, setUpdated] = useState(0);
+  const stick = useRef(new Map<string, boolean>());
+  const panes = useRef(new Map<string, HTMLPreElement>());
+  useEffect(() => {
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let controller: AbortController | null = null;
+    setData(null);
+    setError("");
+    async function load() {
+      controller = new AbortController();
+      const timeout = setTimeout(() => controller?.abort(), 8000);
+      try {
+        const response = await fetch(`./api/jobs/${encodeURIComponent(id)}/log?tail=${LOG_TAIL}`, {
+          signal: controller.signal,
+          cache: "no-store",
+        });
+        if (response.status === 404) throw new Error("暂无日志目录（任务尚未启动或记录已清理）");
+        if (!response.ok) throw new Error(`日志接口返回 HTTP ${response.status}`);
+        const next = (await response.json()) as LogPayload;
+        if (!next || typeof next.files !== "object" || next.files === null) throw new Error("日志数据格式错误");
+        if (active) {
+          for (const [name, pane] of panes.current)
+            stick.current.set(name, pane.scrollHeight - pane.scrollTop - pane.clientHeight < 24);
+          setData(next);
+          setError("");
+          setUpdated(Date.now());
+        }
+      } catch (e) {
+        if (active) setError(e instanceof Error && e.name !== "AbortError" ? e.message : "日志请求超时");
+      } finally {
+        clearTimeout(timeout);
+        if (active && running) timer = setTimeout(load, LOG_POLL_MS);
+      }
+    }
+    void load();
+    return () => {
+      active = false;
+      controller?.abort();
+      clearTimeout(timer);
+    };
+  }, [id, running]);
+  // Keep following the tail unless the reader scrolled up.
+  useEffect(() => {
+    for (const [name, pane] of panes.current)
+      if (stick.current.get(name) !== false) pane.scrollTop = pane.scrollHeight;
+  }, [data]);
+  const names = data ? Object.keys(data.files) : [];
+  return (
+    <div className="log-viewer" data-testid="log-viewer">
+      <h5>
+        日志尾部 <small>最近 {LOG_TAIL} 行</small>
+        {running && <small className="muted"> · 运行中，每 3 秒刷新</small>}
+      </h5>
+      {error && (
+        <p className="warn" role="status" data-testid="log-error">
+          {error}
+        </p>
+      )}
+      {!data && !error && <p className="muted">正在读取日志…</p>}
+      {data && !names.length && !error && <p className="muted">日志目录中没有可读取的日志文件。</p>}
+      {names.map((name) => (
+        <section key={name} data-testid={`log-file-${name}`}>
+          <h5 className="mono">{name}</h5>
+          <pre
+            className="log-pre log-full"
+            ref={(node) => {
+              if (node) panes.current.set(name, node);
+              else panes.current.delete(name);
+            }}
+          >
+            {data!.files[name] || "（空）"}
+          </pre>
+        </section>
+      ))}
+      {fallback && (!data || !names.length) && (
+        <>
+          <h5>最后一行</h5>
+          <pre className="log-pre">{fallback}</pre>
+        </>
+      )}
+      {updated > 0 && <p className="muted small">读取于 {clock(updated)}</p>}
+    </div>
+  );
+}
+
 export function JobInspector({
   row,
   missingId,
@@ -83,7 +180,7 @@ export function JobInspector({
   const [tab, setTab] = useState<Tab>(row?.bucket === "queued" ? "reasons" : "overview");
   if (!row)
     return (
-      <aside className="inspector panel" aria-label="任务详情">
+      <aside className="inspector panel" aria-label="任务详情" data-testid="job-inspector">
         <div className="inspector-head">
           <div className="kicker-row">
             <span className="kicker">JOB INSPECTOR</span>
@@ -118,7 +215,12 @@ export function JobInspector({
     ["reasons", reasons.length ? `排队原因 ${reasons.length}` : "排队原因"],
   ];
   return (
-    <aside className={cn("inspector panel", `t-${row.kind}`)} aria-label={`任务详情 ${j.id}`}>
+    <aside
+      className={cn("inspector panel", `t-${row.kind}`)}
+      aria-label={`任务详情 ${j.id}`}
+      data-testid="job-inspector"
+      data-job-id={j.id}
+    >
       <div className="inspector-head">
         <div className="kicker-row">
           <span className="kicker">JOB INSPECTOR</span>
@@ -139,6 +241,7 @@ export function JobInspector({
             key={id}
             type="button"
             role="tab"
+            data-testid={`inspector-tab-${id}`}
             aria-selected={tab === id}
             className={cn(tab === id && "active")}
             onClick={() => setTab(id)}
@@ -196,12 +299,7 @@ export function JobInspector({
         )}
         {tab === "log" && (
           <>
-            <h5>最后一行</h5>
-            {j.log_last_line ? (
-              <pre className="log-pre">{j.log_last_line}</pre>
-            ) : (
-              <p className="muted">当前快照无日志正文（不能据此判断任务卡死）。</p>
-            )}
+            <LogViewer id={j.id} running={row.bucket === "running"} fallback={j.log_last_line} />
             <h5>日志路径</h5>
             <PathLine value={j.log} />
           </>
@@ -213,7 +311,7 @@ export function JobInspector({
             <p className="muted">此任务不在队列中，没有排队原因。</p>
           ))}
       </div>
-      <footer className="inspector-foot">只读快照 · 路径仅为元数据，不可在此读取文件</footer>
+      <footer className="inspector-foot">只读快照 · 日志经只读接口读取（尾部，非完整文件）</footer>
     </aside>
   );
 }

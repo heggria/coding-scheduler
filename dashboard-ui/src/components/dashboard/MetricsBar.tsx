@@ -54,7 +54,7 @@ export function MetricsBar({
     .map((k) => [k, done.filter((r) => r.kind === k).length] as const)
     .filter(([, n]) => n > 0);
   return (
-    <section className="metric-strip" aria-label="全局执行池与队列概览">
+    <section className="metric-strip" aria-label="全局执行池与队列概览" data-testid="metrics-bar">
       {POOLS.map((pool) => {
         const used = num(state?.counts?.[pool]);
         const cap = num(state?.caps?.[pool]);
@@ -65,6 +65,7 @@ export function MetricsBar({
             key={pool}
             type="button"
             className={cn("metric metric-pool", pool, active && "active")}
+            data-testid={`metric-pool-${pool}`}
             aria-pressed={active}
             onClick={() => onPool(active ? "all" : pool)}
             title={active ? "取消执行池筛选" : `只看 ${pool} 池任务`}
@@ -86,7 +87,7 @@ export function MetricsBar({
           </button>
         );
       })}
-      <div className="metric">
+      <div className="metric" data-testid="metric-queued">
         <div className="metric-label">
           <span>排队 / 全局</span>
           {queued === 0 && state ? <span className="ok">无等待任务</span> : null}
@@ -106,7 +107,7 @@ export function MetricsBar({
               : "空槽位不代表所有任务都可启动"}
         </div>
       </div>
-      <div className="metric">
+      <div className="metric" data-testid="metric-done">
         <div className="metric-label">
           <span>近 24h / 已结束</span>
           <span>{done.length ? `${Math.round((ok / done.length) * 100)}% 成功` : "—"}</span>

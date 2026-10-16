@@ -15,18 +15,22 @@ export function PoolSlots({
   cap: number | null;
 }) {
   if (cap == null || cap <= 0)
-    return <div className="slots slots-unknown">容量未知</div>;
+    return <div className="slots slots-unknown" data-testid={`pool-slots-${pool}`}>容量未知</div>;
   const u = Math.max(0, used ?? 0);
   const total = Math.max(cap, u);
   return (
     <div
       className={cn("slots", pool)}
+      data-testid={`pool-slots-${pool}`}
+      data-used={u}
+      data-cap={cap}
       role="img"
       aria-label={`${pool} 槽位 ${used ?? "未知"} / ${cap}`}
     >
       {Array.from({ length: total }, (_, i) => (
         <span
           key={i}
+          data-testid="pool-slot"
           className={cn("slot", i < u && "used", i >= cap && "over")}
         >
           <i />

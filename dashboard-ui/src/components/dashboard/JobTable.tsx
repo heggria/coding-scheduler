@@ -79,7 +79,7 @@ export function JobTable({
   };
   return (
     <div className="table-scroll">
-      <table className="job-table">
+      <table className="job-table" data-testid="job-table">
         <colgroup>
           <col className="c-job" />
           <col className="c-project" />
@@ -109,6 +109,8 @@ export function JobTable({
               <tr
                 key={j.id}
                 data-id={j.id}
+                data-testid={`job-row-${j.id}`}
+                data-kind={row.kind}
                 tabIndex={0}
                 aria-selected={selectedId === j.id}
                 className={cn(

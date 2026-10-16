@@ -1,12 +1,13 @@
 """Read-only dashboard: never lock, reclaim, schedule, or write scheduler state."""
 import json
 import mimetypes
+import re
 import subprocess
 import time
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from affinity import CC_CAP, CODEX_CAP, model_for
 from core import TZ, counts, home, load_jobs, reason_text, remote_dir
@@ -15,6 +16,68 @@ TAIL_BYTES = 8192
 LABEL = "com.heggria.cs-tick"
 DIST = Path(__file__).with_name("dashboard_dist")
 CACHE_SECONDS = 2
+JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+LOG_ROUTE = re.compile(r"^/api/jobs/([^/]+)/log$")
+LOG_NAMES = ("log", "stdout", "stderr", "conclusion.md")
+LOG_SUFFIXES = (".log", ".out", ".err")
+LOG_TAIL_DEFAULT, LOG_TAIL_MAX = 200, 2000
+LOG_FILE_BYTES = 256 * 1024
+LOG_MAX_FILES = 12
+
+
+class BadRequest(Exception):
+    pass
+
+
+def parse_tail(query):
+    values = parse_qs(query, keep_blank_values=True).get("tail")
+    if values is None:
+        return LOG_TAIL_DEFAULT
+    if len(values) != 1 or not re.fullmatch(r"[0-9]{1,6}", values[0]):
+        raise BadRequest("tail must be an integer")
+    count = int(values[0])
+    if not 1 <= count <= LOG_TAIL_MAX:
+        raise BadRequest("tail out of range")
+    return count
+
+
+def tail_lines(path, count):
+    """Last count lines of at most LOG_FILE_BYTES; drop a line cut by the byte cap."""
+    try:
+        size = Path(path).stat().st_size
+    except OSError:
+        return ""
+    text = tail(path, LOG_FILE_BYTES)
+    lines = text.splitlines()
+    if size > LOG_FILE_BYTES and len(lines) > 1:
+        lines = lines[1:]
+    return "\n".join(lines[-count:])
+
+
+def job_logs(jid, count):
+    """Read-only log tails for one job; None when the job directory is absent."""
+    if not JOB_ID.match(jid) or ".." in jid:
+        raise BadRequest("bad job id")
+    directory = remote_dir(jid)
+    try:
+        root = directory.parent.resolve()
+        resolved = directory.resolve()
+        if resolved.parent != root or not resolved.is_dir():
+            return None
+        names = sorted(item.name for item in resolved.iterdir()
+                       if item.name in LOG_NAMES or item.name.endswith(LOG_SUFFIXES))
+    except OSError:
+        return None
+    files = {}
+    for name in names[:LOG_MAX_FILES]:
+        try:
+            target = (resolved / name).resolve()
+        except OSError:
+            continue
+        if target.parent != resolved or not target.is_file():
+            continue  # symlink escaping the job directory, or not a regular file
+        files[name] = tail_lines(target, count)
+    return {"id": jid, "files": files}
 
 
 def tail(path, limit=TAIL_BYTES):
@@ -170,7 +233,26 @@ def make_server(host, port, status_command=None):
 
         def do_GET(self):
             try:
-                path = unquote(urlsplit(self.path).path)
+                parts = urlsplit(self.path)
+                match = LOG_ROUTE.match(parts.path)
+                if match or parts.path.startswith("/api/jobs/"):
+                    try:
+                        if not match:
+                            self.respond(404, b"Not found", "text/plain; charset=utf-8")
+                            return
+                        count = parse_tail(parts.query)
+                        result = job_logs(unquote(match.group(1)), count)
+                    except BadRequest as error:
+                        body = json.dumps({"error": str(error)}).encode("utf-8")
+                        self.respond(400, body, "application/json; charset=utf-8")
+                        return
+                    if result is None:
+                        self.respond(404, b'{"error":"job not found"}', "application/json; charset=utf-8")
+                    else:
+                        self.respond(200, json.dumps(result, ensure_ascii=False).encode("utf-8"),
+                                     "application/json; charset=utf-8")
+                    return
+                path = unquote(parts.path)
                 if path == "/api/state":
                     current = time.monotonic()
                     if cached["at"] is None or current - cached["at"] >= CACHE_SECONDS:

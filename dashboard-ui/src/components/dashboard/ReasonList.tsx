@@ -9,9 +9,9 @@ export function ReasonChips({ job }: { job: Job }) {
   if (!reasons.length) return <span className="muted">暂无原因记录</span>;
   const shown = reasons.slice(0, 2);
   return (
-    <span className="reason-chips" title={reasons.map(describe).join("\n")}>
+    <span className="reason-chips" data-testid="reason-chips" title={reasons.map(describe).join("\n")}>
       {shown.map((r, i) => (
-        <span key={i} className={cn("reason-chip", reasonTone(r))}>
+        <span key={i} data-testid="reason-chip" data-reason={r.type} className={cn("reason-chip", reasonTone(r))}>
           {r.type === "lock" && <Lock size={10} aria-hidden />}
           {reasonLabel(r)}
           {r.type === "lock" && r.job ? <b className="mono"> ← {r.job}</b> : null}
@@ -45,12 +45,12 @@ export function ReasonList({
 }) {
   const reasons = reasonsOf(job);
   return (
-    <div className="reason-list">
+    <div className="reason-list" data-testid="reason-list">
       {!reasons.length && (
         <p className="empty-note">暂无原因记录（不自动归因为等待 tick）。</p>
       )}
       {reasons.map((r, i) => (
-        <div key={i} className={cn("reason-card", reasonTone(r))}>
+        <div key={i} data-testid="reason-card" data-reason={r.type} className={cn("reason-card", reasonTone(r))}>
           <h4>{reasonLabel(r)}</h4>
           {r.type === "lock" && (
             <dl>

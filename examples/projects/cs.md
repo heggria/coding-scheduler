@@ -5,6 +5,7 @@
 - 兼容 /usr/bin/python3 3.9，不使用 match 或 X | Y 类型注解。
 - 测试和冒烟使用临时 CS_HOME；不启动真实模型 worker 做测试。
 - 使用 /usr/bin/python3 -m unittest discover -s tests_cs 验证。
+- `--files` 必须逐一列出输出/可写文件（含评审文档）的准确路径，不要填目录；仅 `--area research --read-only` 同时指定时可留空。
 
 ## 结论格式
 

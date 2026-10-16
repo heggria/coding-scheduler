@@ -47,6 +47,9 @@ class SchedulerTests(unittest.TestCase):
         return out.getvalue()
 
     def submit(self, jid="one", *extra, **kwargs):
+        # Generic fixtures use read-only research; explicit areas supply their own flags.
+        if "--area" not in extra:
+            extra = ("--read-only",) + extra
         return json.loads(self.cli("submit", "--project", "fixture", "--area", "research", "--tier", "M",
                                    "--cwd", str(self.cwd), "--id", jid, "--json", *extra, **kwargs))
 
@@ -143,7 +146,7 @@ class SchedulerTests(unittest.TestCase):
     def test_submit_text_stdin_file_and_templates(self):
         (self.root / "projects/fixture.md").write_text("project rules\n")
         declaration = ('## 本单声明\n- cwd: %s\n- 可写文件清单 (files): 无\n'
-                       '- shared 锁文件 (shared_files): 无\n- area: research\n- read-only: 否'
+                       '- shared 锁文件 (shared_files): 无\n- area: research\n- read-only: 是'
                        % self.cwd)
         first = self.submit("inline", "--prompt-text", "goal")
         self.assertEqual(first["schema_version"], "1")
@@ -165,7 +168,7 @@ class SchedulerTests(unittest.TestCase):
         cases = [
             ("write", ["--files", " src/a.py, src/b.py ", "--lock-shared", " src/core.py "],
              '["src/a.py", "src/b.py"]', '["src/core.py"]', "否"),
-            ("readonly", ["--read-only"], "无", "无", "是"),
+            ("readonly", ["--read-only", "--files", "review.md"], '["review.md"]', "无", "是"),
             ("no-template", ["--no-template", "--files", "task.py"], '["task.py"]', "无", "否"),
         ]
         for jid, flags, files, shared, read_only in cases:
@@ -203,15 +206,27 @@ class SchedulerTests(unittest.TestCase):
         self.assertIn("--files is required", err.getvalue())
 
     def test_submit_empty_files_exemptions_and_exact_files(self):
-        cases = [("research", "research", []), ("files", "backend", ["--files", " a.py, b.py "])]
-        for area in ("backend", "protocol", "frontend", "ui-copy", "test", "review", "ops-script", "research"):
-            cases.append(("readonly-" + area, area, ["--read-only"]))
-        for jid, area, flags in cases:
-            with self.subTest(jid=jid):
-                self.submit(jid, "--area", area, "--prompt-text", "goal", *flags)
-                job = core.find_job(self.root, jid)
-                self.assertEqual(job["files"], ["a.py", "b.py"] if jid == "files" else [])
-                self.assertTrue(Path(job["prompt_file"]).is_file())
+        areas = ("backend", "protocol", "frontend", "ui-copy", "test", "review", "ops-script", "research")
+        for area in areas:
+            for read_only in (False, True):
+                for files in ("", " , , ", " a.py, b.py "):
+                    with self.subTest(area=area, read_only=read_only, files=files):
+                        jid = "case-%s" % len(list((self.root / "queue").glob("*.json")))
+                        flags = ["--read-only"] if read_only else []
+                        accepted = bool(files.strip(" ,")) or (area == "research" and read_only)
+                        result = self.submit(jid, "--area", area, "--prompt-text", "goal",
+                                             "--files", files, *flags, expected=0 if accepted else 2)
+                        self.assertEqual(result["schema_version"], "1")
+                        if accepted:
+                            job = core.find_job(self.root, jid)
+                            self.assertEqual(job["files"], ["a.py", "b.py"] if files.strip(" ,") else [])
+                            self.assertEqual(job["read_only"], read_only)
+                            self.assertTrue(Path(job["prompt_file"]).is_file())
+                        else:
+                            for text in ("--files is required", "review docs", "never a directory",
+                                         "--area research --read-only", "逐一", "评审文档"):
+                                self.assertIn(text, result["error"])
+                            self.assertIsNone(core.find_job(self.root, jid))
 
     def test_submit_reports_blockers_immediately_with_or_without_tick(self):
         (self.root / "quota.json").write_text('{"codex": 0, "cc": 0}')
@@ -543,8 +558,8 @@ class SchedulerTests(unittest.TestCase):
 
     def test_research_and_explicit_read_only_do_not_require_code_delivery(self):
         text = "分析完成。未提交代码，未推送，未开 PR；只读研究未启动子 agent。"
-        for jid, area, flags in [("research", "research", []),
-                                 ("read-only", "review", ["--read-only"])]:
+        for jid, area, flags in [("research", "research", ["--read-only"]),
+                                 ("read-only", "review", ["--read-only", "--files", "review.md"])]:
             self.submit(jid, "--area", area, "--prompt-text", "analysis", "--tick", *flags)
             conclusion = core.remote_dir(jid) / "conclusion.md"
             conclusion.write_text(text)

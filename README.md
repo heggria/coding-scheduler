@@ -20,10 +20,10 @@ cs status --json
 `tick`、`wait` 默认就输出 JSON。JSON 模式错误也返回同一版本字段和非零退出码。
 
 ```bash
-cs submit --project cs --area research --tier M --cwd "$PWD" \
+cs submit --project cs --area research --read-only --tier M --cwd "$PWD" \
   --prompt-text '分析排队瓶颈，给出结论' --idempotency-key issue-123 --model gpt-6.1-sol --tick --json
 printf '%s\n' '目标与验收条件' | cs submit --project cs --area test --tier L \
-  --cwd "$PWD" --prompt - --tick --json
+  --cwd "$PWD" --prompt - --files tests_cs/test_scheduler.py --tick --json
 cs wait job-a job-b --tick --timeout 600 --lines 10
 cs status job-a --json --lines 20
 cs status --no-reclaim --json
@@ -33,8 +33,11 @@ cs board --json
 - `--prompt 文件`、`--prompt -`（stdin）、`--prompt-text 文本` 三选一。
 - 同一非空 `--idempotency-key` 重试返回 queue/running/done 中已有任务，不覆盖 prompt，
   不重复启动；key 在状态根目录内全局唯一。显式 `--id` 重复则报错，自动 ID 带随机尾缀。
+- `--files` 必须逐一列出输出/可写文件的准确路径（包括要写的评审文档），不要填目录。
+  仅同时指定 `--area research --read-only` 时允许为空；review/backend 等即使
+  指定 `--read-only` 也必须列出文件。非空目录锁仍只警告，不拒绝。
 - `--model` 透传给所选 codex/claude，省略沿用默认模型；`research` 和显式 `--read-only`
-  的单以分析结论为交付，结论提到“未提交/未推送/只读”等不再误判 blocked。
+  的单可交付分析结论；这不豁免上述 `--files` 要求。结论提到“未提交/未推送/只读”等不再误判 blocked。
   所有任务统一使用下述退出证据与结构化状态规则，不扫描自然语言未交付短语。
 - submit 默认只排队，并立即返回全部已知阻塞原因和 `awaiting_tick`；`--tick` 才尝试启动。
   `submit --tick --json` 只返回本单的状态、原因和摘要，不包含其他单或全局 schedule。

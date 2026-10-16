@@ -58,8 +58,9 @@ def line_count(value):
 def cmd_submit(args):
     files = [f.strip() for f in args.files.split(",") if f.strip()]
     shared_files = [f.strip() for f in args.lock_shared.split(",") if f.strip()]
-    if not files and args.area != "research" and not args.read_only:
-        return error(args, "--files is required (exact file paths); omit only for --area research or --read-only")
+    if not files and not (args.area == "research" and args.read_only):
+        return error(args, "--files is required: list each output/writable file path individually (including review docs), never a directory; empty --files is allowed only for --area research --read-only. "
+                     "必须用 --files 逐一列出输出/可写文件的准确路径（包括要写的评审文档），不要填写目录；仅 --area research --read-only 可留空。")
     root = ensure()
     if args.idempotency_key:
         for folder in ("queue", "running", "done"):
@@ -278,11 +279,11 @@ def main():
     s.add_argument("--idempotency-key", default=None)
     s.add_argument("--pin", choices=["codex", "cc"], default=None)
     s.add_argument("--risk", choices=["low", "high"], default="low")
-    s.add_argument("--files", default="", help="comma-separated exact file paths (directory paths warn)")
+    s.add_argument("--files", default="", help="comma-separated exact output/writable file paths, including review docs; empty only with --area research --read-only (directory paths warn)")
     s.add_argument("--lock-shared", default="", help="comma-separated exact resource paths")
     s.add_argument("--id", type=identifier, default=None)
     s.add_argument("--review-of", choices=["codex", "cc"], default=None)
-    s.add_argument("--read-only", action="store_true", help="conclusion does not require code delivery")
+    s.add_argument("--read-only", action="store_true", help="conclusion does not require code delivery; empty --files only with --area research")
     s.add_argument("--tick", action="store_true")
     s.set_defaults(func=cmd_submit)
 

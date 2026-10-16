@@ -220,7 +220,7 @@ class GitIntegrationTests(unittest.TestCase):
             conflicts = file_conflict(a, [b])
             self.assertEqual(conflicts[0]["repo"], None)
 
-    def test_tick_isolated_state_no_launch_and_blocked_by_changes_only(self):
+    def test_tick_isolated_state_no_launch_and_blocked_by_stays_stable(self):
         with tempfile.TemporaryDirectory() as state, patch.dict(os.environ, {"CODING_SCHEDULER_HOME": state}):
             root = core.ensure()
             active = job("active", self.main, ["src/agent.py"])
@@ -249,7 +249,11 @@ class GitIntegrationTests(unittest.TestCase):
                 self.assertFalse(core.tick(root)["started"])
                 with patch.object(core, "write_job", wraps=core.write_job) as write:
                     self.assertFalse(core.tick(root)["started"])
-                    write.assert_not_called()
+                    # Each pass now persists last_checked even if locks are stable.
+                    self.assertTrue(write.called)
+                refreshed = {j["id"]: j for j in core.load_jobs(root, "queue")}
+                self.assertEqual(refreshed["same"]["blocked_by"], queued["same"]["blocked_by"])
+                self.assertGreater(refreshed["same"]["last_checked"], queued["same"]["last_checked"])
                 for running in core.load_jobs(root, "running"):
                     core.remove_job(root, "running", running["id"])
                 # Unblock one job; fake launch observes the cleared metadata.

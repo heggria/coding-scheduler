@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Read-only copy of production state, then a fake-worker-only CLI smoke."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+
+REPO = Path(__file__).resolve().parents[1]
+
+
+def fingerprint(root):
+    if not root.exists():
+        return None
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        digest.update(str(path.relative_to(root)).encode())
+        if path.is_symlink():
+            digest.update(os.readlink(path).encode())
+        elif path.is_file():
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def main():
+    source = Path.home() / ".coding-scheduler"
+    before = fingerprint(source)
+    smoke_dir = Path(tempfile.mkdtemp(prefix="cs-AD-smoke-", dir="/tmp"))
+    root = smoke_dir / "state"
+    if source.exists():
+        # Dereference links into independent copies, never reuse a writable link.
+        shutil.copytree(source, root, symlinks=False)
+    else:
+        root.mkdir()
+    archive = root / "inherited-snapshot"
+    archive.mkdir(exist_ok=True)
+    # Never schedule or signal copied production jobs/PIDs. Only fresh fake jobs.
+    for name in ("queue", "running", "done", "quota.json"):
+        path = root / name
+        if path.exists():
+            path.rename(archive / name)
+    cwd = smoke_dir / "worktree"
+    cwd.mkdir()
+    env = dict(os.environ, CS_HOME=str(root), CS_TEST_FAKE_WORKER="1")
+    for args in (["init"], ["-c", "user.name=Smoke", "-c", "user.email=smoke@example.invalid",
+                            "commit", "--allow-empty", "-m", "smoke base"]):
+        subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, timeout=10)
+    records = []
+
+    def cs(*args):
+        result = subprocess.run(["/usr/bin/python3", str(REPO / "bin/cs"), *args, "--json"],
+                                env=env, capture_output=True, text=True, timeout=10)
+        (smoke_dir / (args[0] + ".json")).write_text(result.stdout)
+        assert result.returncode == 0, (args[0], result.returncode, result.stderr)
+        data = json.loads(result.stdout)
+        assert data["schema_version"] == "1"
+        records.append({"command": args[0], "exit": result.returncode})
+        return data
+
+    jid = "cs-ad-smoke"
+    submitted = cs("submit", "--project", "cs", "--area", "research", "--tier", "L",
+                   "--cwd", str(cwd), "--id", jid, "--prompt-text", "Only run the fake worker.",
+                   "--no-template", "--idempotency-key", "cs-ad-smoke")
+    assert submitted["job"]["status"] == "queued"
+    assert submitted["job"]["queue_reasons"] == [{"type": "awaiting_tick"}]
+    assert cs("tick")["started"] == [jid]
+    waited = cs("wait", jid, "--timeout", "5", "--lines", "2")
+    assert not waited["timed_out"] and waited["jobs"][0]["status"] == "done"
+    assert waited["jobs"][0]["exit"] == 0
+    assert waited["jobs"][0]["changed_files"] == []
+    assert cs("status", jid)["job"]["status"] == "done"
+    board = Path(cs("board")["path"])
+    assert "原因" in board.read_text()
+    assert (root / "workers" / jid / "log").read_text() == "test fake worker\n"
+    assert fingerprint(source) == before, "production source changed during smoke; investigate external writes"
+    report = {"source_exists": source.exists(), "source_unchanged": True,
+              "fake_worker": True, "directory": str(smoke_dir), "steps": records}
+    (smoke_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    print(json.dumps(report, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

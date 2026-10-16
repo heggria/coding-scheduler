@@ -4,201 +4,295 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
-import shutil
+import re
 import sys
-from datetime import datetime, timedelta, timezone
+import time
+import uuid
+from datetime import datetime
 from pathlib import Path
 
 LIB = Path(__file__).resolve().parents[1] / "lib"
 sys.path.insert(0, str(LIB))
 
-from affinity import CC_CAP, CODEX_CAP  # noqa: E402
-from locks import directory_locks, lock_context  # noqa: E402
-from core import (  # noqa: E402
-    doctor_checks,
-    ensure,
-    home,
-    load_jobs,
-    reclaim,
-    remove_job,
-    tick,
-    write_board,
-    write_job,
-)
+from affinity import CC_CAP, CODEX_CAP
+from locks import directory_locks, lock_context
+from core import (TZ, check_queue, counts, doctor_checks, ensure, find_job,
+                  job_summary, load_jobs, reason_text, reclaim, remove_job,
+                  state_lock, tick, write_board, write_job)
 
-TZ = timezone(timedelta(hours=8))
+
+def emit(value):
+    print(json.dumps(dict(schema_version="1", **value), ensure_ascii=False))
+
+
+def error(args, message, code=2):
+    if args.json:
+        emit({"error": message})
+    else:
+        print(message, file=sys.stderr)
+    return code
+
+
+def identifier(value):
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", value) or value in (".", ".."):
+        raise argparse.ArgumentTypeError("use letters, digits, underscore, dot or hyphen")
+    return value
+
+
+def nonnegative(value):
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError("must be a finite nonnegative number")
+    return number
+
+
+def line_count(value):
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be nonnegative")
+    return number
 
 
 def cmd_submit(args):
     root = ensure()
-    ts = datetime.now(TZ).strftime("%Y%m%d-%H%M%S")
-    jid = args.id or f"{args.project}-{args.area}-{ts}"
-    prompt_src = Path(args.prompt).expanduser().resolve()
-    if not prompt_src.exists():
-        print(f"prompt not found: {prompt_src}", file=sys.stderr)
-        return 2
-    prompt_dst = root / "queue" / f"{jid}.prompt.md"
-    prompt_dst.write_text(prompt_src.read_text())
-    files = [f.strip() for f in (args.files or "").split(",") if f.strip()]
-    shared_files = [f.strip() for f in (args.lock_shared or "").split(",") if f.strip()]
+    if args.idempotency_key:
+        for folder in ("queue", "running", "done"):
+            for job in load_jobs(root, folder):
+                if job.get("idempotency_key") == args.idempotency_key:
+                    return submitted(args, job, existing=True)
+    jid = args.id or "%s-%s-%s-%s" % (
+        args.project, args.area, datetime.now(TZ).strftime("%Y%m%d-%H%M%S"), uuid.uuid4().hex[:8])
+    if find_job(root, jid):
+        return error(args, "job id already exists: " + jid)
+    cwd = Path(args.cwd).expanduser().resolve()
+    if not cwd.is_dir():
+        return error(args, "cwd is not a directory: " + str(cwd))
+    if args.prompt_text is not None:
+        body = args.prompt_text
+    elif args.prompt == "-":
+        body = sys.stdin.read()
+    else:
+        body = Path(args.prompt).expanduser().read_text()
+    template = root / "projects" / (args.project + ".md")
+    if not args.no_template and template.is_file():
+        body = template.read_text().rstrip() + "\n\n" + body
+    prompt_dst = root / "queue" / (jid + ".prompt.md")
+    prompt_dst.write_text(body)
     job = {
-        "id": jid,
-        "project": args.project,
-        "area": args.area,
-        "tier": args.tier,
-        "pin": args.pin,
-        "risk": args.risk,
-        "files": files,
-        "shared_files": shared_files,
-        "cwd": str(Path(args.cwd).expanduser().resolve()),
-        "prompt_file": str(prompt_dst),
-        "created_at": datetime.now(TZ).isoformat(),
-        "status": "queued",
-        "pool": None,
-        "affinity": {},
-        "pid": None,
-        "conclusion": None,
-        "exit": None,
+        "id": jid, "project": args.project, "area": args.area, "tier": args.tier,
+        "pin": args.pin, "risk": args.risk,
+        "files": [f.strip() for f in args.files.split(",") if f.strip()],
+        "shared_files": [f.strip() for f in args.lock_shared.split(",") if f.strip()],
+        "cwd": str(cwd), "prompt_file": str(prompt_dst),
+        "created_at": datetime.now(TZ).isoformat(), "status": "queued",
+        "pool": None, "affinity": {}, "pid": None, "conclusion": None, "exit": None,
+        "idempotency_key": args.idempotency_key, "model": args.model,
     }
     if args.review_of:
         job["review_of"] = args.review_of
     job["lock_ctx"] = lock_context(job)
     for path in directory_locks(job["lock_ctx"]):
-        print(f"WARNING: directory lock {path!r} covers all descendant paths", file=sys.stderr)
+        print("WARNING: directory lock %r covers all descendant paths" % path, file=sys.stderr)
+    check_queue(root, job, load_jobs(root, "running"))
+    if not args.tick:
+        job["queue_reasons"].append({"type": "awaiting_tick"})
     write_job(root, "queue", job)
-    print(jid)
-    if args.tick:
-        result = tick(root)
-        print(json.dumps(result, ensure_ascii=False))
+    result = tick(root) if args.tick else None
+    write_board(root)
+    return submitted(args, find_job(root, jid), schedule=result)
+
+
+def submitted(args, job, existing=False, schedule=None):
+    if args.json:
+        result = {"id": job["id"], "existing": existing, "job": job_summary(job)}
+        if schedule is not None:
+            result["schedule"] = schedule
+        emit(result)
+    else:
+        print(job["id"])
+        if job.get("status") == "queued":
+            print(reason_text(job.get("queue_reasons", [])))
+        if schedule is not None:
+            emit(schedule)
     return 0
 
 
-def cmd_tick(_args):
-    result = tick(ensure())
-    print(json.dumps(result, ensure_ascii=False))
+def cmd_tick(args):
+    emit(tick(ensure()))
     return 0
 
 
 def cmd_status(args):
     root = ensure()
-    # Reap finished workers so the board is not full of corpses, then refresh board.md.
     reclaimed = reclaim(root)
     write_board(root)
-    running = load_jobs(root, "running")
-    queued = load_jobs(root, "queue")
-    c = {"codex": 0, "cc": 0}
-    for j in running:
-        if j.get("pool") in c:
-            c[j["pool"]] += 1
-    if args.json:
-        print(json.dumps({
-            "counts": c,
-            "caps": {"codex": CODEX_CAP, "cc": CC_CAP},
-            "reclaimed": reclaimed,
-            "running": running,
-            "queued": queued,
-        }, ensure_ascii=False, indent=2))
+    if args.id:
+        job = find_job(root, args.id)
+        if job is None:
+            return error(args, "not found: " + args.id, 1)
+        summary = job_summary(job, args.lines)
+        if args.json:
+            emit({"job": summary})
+        else:
+            print("[%s] %s exit=%s elapsed=%ss" % (summary["status"], args.id,
+                  summary["exit"], summary["elapsed_seconds"]))
+            print(reason_text(summary["queue_reasons"]))
+            print("\n".join(summary["conclusion"]))
+            print(json.dumps(summary["artifacts"], ensure_ascii=False))
         return 0
-    print(f"Codex {c['codex']}/{CODEX_CAP}  CC {c['cc']}/{CC_CAP}")
-    print(f"running={len(running)} queued={len(queued)} reclaimed={reclaimed}")
-    for j in running + queued:
-        print(f"  [{j.get('status')}] {j.get('id')} tier={j.get('tier')} pool={j.get('pool') or '-'} area={j.get('area')}")
+    running, queued = load_jobs(root, "running"), load_jobs(root, "queue")
+    c = counts(running)
+    if args.json:
+        emit({"counts": c, "caps": {"codex": CODEX_CAP, "cc": CC_CAP},
+              "reclaimed": reclaimed, "running": running, "queued": queued})
+    else:
+        print("Codex %s/%s  CC %s/%s" % (c["codex"], CODEX_CAP, c["cc"], CC_CAP))
+        print("running=%s queued=%s reclaimed=%s" % (len(running), len(queued), reclaimed))
+        for job in running + queued:
+            print("  [%s] %s tier=%s pool=%s area=%s %s" %
+                  (job.get("status"), job["id"], job.get("tier"), job.get("pool") or "-",
+                   job.get("area"), reason_text(job.get("queue_reasons", []))))
     return 0
+
+
+def cmd_wait(args):
+    root = ensure()
+    deadline = None if args.timeout is None else time.monotonic() + args.timeout
+    ids = list(dict.fromkeys(args.ids))
+    while True:
+        # Release the state lock between checks so tick/cancel/other bots can run.
+        with state_lock(root):
+            reclaim(root)
+            jobs = [find_job(root, jid) for jid in ids]
+            missing = [jid for jid, job in zip(ids, jobs) if job is None]
+            if missing:
+                emit({"error": "not found", "ids": missing})
+                return 1
+            finished = all(job.get("status") not in ("queued", "running") for job in jobs)
+            timed_out = not finished and deadline is not None and time.monotonic() >= deadline
+            if finished or timed_out:
+                write_board(root)
+                emit({"timed_out": timed_out, "jobs": [job_summary(job, args.lines) for job in jobs]})
+                return 124 if timed_out else 0
+        remaining = None if deadline is None else deadline - time.monotonic()
+        time.sleep(0.2 if remaining is None else max(0, min(0.2, remaining)))
 
 
 def cmd_cancel(args):
     root = ensure()
-    jid = args.id
     for folder in ("queue", "running"):
-        p = root / folder / f"{jid}.json"
-        if not p.exists():
+        path = root / folder / (args.id + ".json")
+        if not path.exists():
             continue
-        job = json.loads(p.read_text())
+        job = json.loads(path.read_text())
         if folder == "running" and job.get("pid"):
             try:
                 os.kill(int(job["pid"]), 15)
             except OSError:
                 pass
-        job["status"] = "cancelled"
-        if getattr(args, "superseded_by", None):
+        job.update(status="cancelled", finished_at=datetime.now(TZ).isoformat(), queue_reasons=[])
+        if args.superseded_by:
             job["superseded_by"] = args.superseded_by
-        job["finished_at"] = datetime.now(TZ).isoformat()
-        remove_job(root, folder, jid)
         write_job(root, "done", job)
+        remove_job(root, folder, args.id)
         write_board(root)
-        if job.get("superseded_by"):
-            print(f"cancelled {jid} superseded_by={job['superseded_by']}")
+        if args.json:
+            emit({"job": job_summary(job), "superseded_by": args.superseded_by})
         else:
-            print(f"cancelled {jid}")
+            print("cancelled " + args.id + (" superseded_by=" + args.superseded_by if args.superseded_by else ""))
         return 0
-    print(f"not found: {jid}", file=sys.stderr)
-    return 1
+    return error(args, "not found: " + args.id, 1)
 
 
-def cmd_board(_args):
+def cmd_board(args):
     path = write_board(ensure())
-    print(path)
+    if args.json:
+        emit({"path": str(path)})
+    else:
+        print(path)
     return 0
 
 
 def cmd_doctor(args):
     root = ensure()
-    print(f"HOME={root}")
-    print(f"board={(root / 'board.md').exists()}")
-    checks = doctor_checks(getattr(args, "cwd", None))
-    bad = 0
-    for c in checks:
-        mark = "ok" if c["ok"] else "FAIL"
-        if not c["ok"]:
-            bad += 1
-        print(f"{mark}\t{c['name']}\t{c['detail']}")
-    return 1 if bad else 0
+    checks = doctor_checks(args.cwd, args.pool)
+    failed = any(c["level"] == "FAIL" for c in checks)
+    if args.json:
+        emit({"home": str(root), "board": (root / "board.md").exists(), "checks": checks})
+    else:
+        print("HOME=" + str(root))
+        for check in checks:
+            print("%s\t%s\t%s" % (check["level"], check["name"], check["detail"]))
+    return 1 if failed else 0
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        if "--json" in sys.argv:
+            emit({"error": message})
+            self.exit(2)
+        super().error(message)
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        prog="cs", description="Lightweight coding scheduler CLI (no daemon)",
-        epilog="submit locks: --files a,b (worktree write); --lock-shared a,b (cross-worktree repo resource)",
-    )
+    ap = Parser(prog="cs", description="Lightweight coding scheduler CLI (no daemon)")
+    ap.add_argument("--json", action="store_true")
     sp = ap.add_subparsers(dest="cmd", required=True)
-
     s = sp.add_parser("submit", help="enqueue a job")
-    s.add_argument("--project", required=True)
-    s.add_argument("--area", required=True, choices=["backend", "protocol", "frontend", "ui-copy", "test", "review", "ops-script"])
+    s.add_argument("--project", required=True, type=identifier)
+    s.add_argument("--area", required=True, choices=["backend", "protocol", "frontend", "ui-copy", "test", "review", "ops-script", "research"])
     s.add_argument("--tier", required=True, choices=["L", "M", "H"])
     s.add_argument("--cwd", required=True)
-    s.add_argument("--prompt", required=True)
+    prompt = s.add_mutually_exclusive_group(required=True)
+    prompt.add_argument("--prompt", help="prompt file, or - for stdin")
+    prompt.add_argument("--prompt-text", help="inline prompt")
+    s.add_argument("--no-template", action="store_true")
+    s.add_argument("--model", default=None)
+    s.add_argument("--idempotency-key", default=None)
     s.add_argument("--pin", choices=["codex", "cc"], default=None)
     s.add_argument("--risk", choices=["low", "high"], default="low")
     s.add_argument("--files", default="", help="comma-separated worktree write path prefixes")
-    s.add_argument("--lock-shared", default="", help="comma-separated repo resource path prefixes (across worktrees)")
-    s.add_argument("--id", default=None)
-    s.add_argument("--review-of", dest="review_of", choices=["codex", "cc"], default=None)
-    s.add_argument("--tick", action="store_true", help="run one schedule pass after submit")
+    s.add_argument("--lock-shared", default="", help="comma-separated repo resource path prefixes")
+    s.add_argument("--id", type=identifier, default=None)
+    s.add_argument("--review-of", choices=["codex", "cc"], default=None)
+    s.add_argument("--tick", action="store_true")
     s.set_defaults(func=cmd_submit)
 
     t = sp.add_parser("tick", help="reclaim finished + start free slots")
     t.set_defaults(func=cmd_tick)
-
-    st = sp.add_parser("status", help="show pool counts and jobs")
-    st.add_argument("--json", action="store_true")
+    st = sp.add_parser("status", help="show pools, or one job including completed jobs")
+    st.add_argument("id", nargs="?", type=identifier)
+    st.add_argument("--lines", type=line_count, default=20)
     st.set_defaults(func=cmd_status)
-
+    w = sp.add_parser("wait", help="wait for all jobs; does not launch queued jobs")
+    w.add_argument("ids", nargs="+", type=identifier)
+    w.add_argument("--timeout", type=nonnegative, default=None)
+    w.add_argument("--lines", type=line_count, default=20)
+    w.set_defaults(func=cmd_wait)
     c = sp.add_parser("cancel", help="cancel queued or running job")
-    c.add_argument("id")
-    c.add_argument("--superseded-by", dest="superseded_by", default=None, help="replacement job id")
+    c.add_argument("id", type=identifier)
+    c.add_argument("--superseded-by", default=None)
     c.set_defaults(func=cmd_cancel)
-
     b = sp.add_parser("board", help="rewrite board.md")
     b.set_defaults(func=cmd_board)
-
     d = sp.add_parser("doctor", help="check paths and CLIs / env preflight")
-    d.add_argument("--cwd", default=None, help="optional worktree to probe git write + trusted-dir")
+    d.add_argument("--cwd", default=None)
+    d.add_argument("--pool", choices=["codex", "cc"], default=None, help="required worker CLI; other CLI checks only warn")
     d.set_defaults(func=cmd_doctor)
-
+    for parser in (s, t, st, w, c, b, d):
+        parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     args = ap.parse_args()
-    return args.func(args)
+    try:
+        if args.cmd == "wait":
+            return args.func(args)
+        with state_lock(ensure()):
+            return args.func(args)
+    except (OSError, ValueError) as exc:
+        return error(args, str(exc))
+    except KeyboardInterrupt:
+        return error(args, "interrupted", 130)
 
 
 if __name__ == "__main__":

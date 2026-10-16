@@ -1,8 +1,13 @@
 """Queue / launch / board helpers for cs CLI."""
 from __future__ import annotations
 
+import fcntl
 import json
+import math
 import os
+import re
+import shlex
+from contextlib import contextmanager
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,12 +23,13 @@ NO_SUB = (
 
 
 def home():
-    return Path(os.environ.get("CODING_SCHEDULER_HOME", Path.home() / ".coding-scheduler"))
+    return Path(os.environ.get("CS_HOME") or os.environ.get("CODING_SCHEDULER_HOME")
+                or Path.home() / ".coding-scheduler").expanduser().resolve()
 
 
 def ensure(root=None):
     root = root or home()
-    for n in ("queue", "running", "done"):
+    for n in ("queue", "running", "done", "projects"):
         (root / n).mkdir(parents=True, exist_ok=True)
     return root
 
@@ -40,7 +46,9 @@ def load_jobs(root, folder):
 
 def write_job(root, folder, job):
     path = root / folder / ("%s.json" % job["id"])
-    path.write_text(json.dumps(job, ensure_ascii=False, indent=2) + "\n")
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(job, ensure_ascii=False, indent=2) + "\n")
+    temporary.replace(path)
 
 
 def remove_job(root, folder, jid):
@@ -65,8 +73,83 @@ def area_counts(running):
     return d
 
 
+@contextmanager
+def state_lock(root):
+    """Serialize CLI state transitions (including idempotent submission)."""
+    with (root / ".lock").open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def remote_dir(jid):
+    # An isolated scheduler must never reuse production worker artifacts.
+    if os.environ.get("CS_HOME") or os.environ.get("CODING_SCHEDULER_HOME"):
+        return home() / "workers" / jid
     return Path.home() / ".remote-jobs" / jid
+
+
+def find_job(root, jid):
+    for folder in ("queue", "running", "done"):
+        path = root / folder / (jid + ".json")
+        if path.exists():
+            return json.loads(path.read_text())
+    return None
+
+
+def git_output(cwd, *args):
+    try:
+        proc = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True,
+                              text=True, timeout=10)
+        return proc.stdout.rstrip("\n") if proc.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def job_summary(job, lines=20):
+    """Bounded bot output; old records need no migration."""
+    started = job.get("started_at")
+    elapsed = None
+    if started:
+        try:
+            begin = datetime.fromisoformat(started)
+            end = datetime.fromisoformat(job["finished_at"]) if job.get("finished_at") else datetime.now(TZ)
+            elapsed = round(max(0, (end - begin).total_seconds()), 3)
+        except (ValueError, TypeError):
+            pass
+    jd = remote_dir(job["id"])
+    conclusion = job.get("conclusion")
+    text = ""
+    if conclusion:
+        try:
+            text = Path(conclusion).read_text(errors="replace")
+        except OSError:
+            pass
+    links = re.findall(
+        r"(?<![A-Za-z0-9_.-])(?:https?://)?github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+\b", text)
+    result = {"id": job["id"], "status": job.get("status", "queued"),
+              "exit": job.get("exit"), "elapsed_seconds": elapsed,
+              "conclusion": text.splitlines()[:lines],
+              "pr_links": list(dict.fromkeys(link if link.startswith("http") else "https://" + link
+                                              for link in links)),
+              "artifacts": {"log": job.get("log") or str(jd / "log"),
+                            "conclusion": conclusion,
+                            "worktree": job.get("cwd")},
+              "queue_reasons": job.get("queue_reasons", []),
+              "last_checked": job.get("last_checked")}
+    if job.get("outcome_reason"):
+        result["outcome_reason"] = job["outcome_reason"]
+    if job.get("block_reasons"):
+        result["block_reasons"] = job["block_reasons"]
+    if job.get("base_sha") and job.get("cwd"):
+        stat = git_output(job["cwd"], "diff", "--stat", job["base_sha"], "--", ".")
+        names = git_output(job["cwd"], "diff", "--name-only", "-z", job["base_sha"], "--", ".")
+        if stat is not None and names is not None:
+            result["diff_stat"] = stat
+            result["changed_files"] = [name for name in names.split("\0") if name]
+    return result
 
 # Conclusion phrases that mean "process exited 0 but work was not delivered".
 BLOCKED_MARKERS = (
@@ -98,138 +181,179 @@ BLOCKED_MARKERS = (
 
 
 def classify_outcome(exit_code, conclusion_path):
-    """Map worker exit + conclusion text to done | failed | blocked."""
+    """No completion evidence is unknown; exit 124 denotes timeout."""
+    if exit_code is None or exit_code == 124:
+        return "unknown", None
     if exit_code != 0:
         return "failed", None
-    if not conclusion_path or not Path(conclusion_path).exists():
-        return "done", None
     try:
-        text = Path(conclusion_path).read_text(errors="replace")
+        text = Path(conclusion_path).read_text(errors="replace") if conclusion_path else ""
     except OSError:
-        return "done", None
-    low = text.lower()
-    hits = [m for m in BLOCKED_MARKERS if m.lower() in low]
-    if hits:
-        return "blocked", hits[:5]
-    return "done", None
+        text = ""
+    if not text.strip():
+        return "blocked", ["missing_conclusion"]
+    hits = [m for m in BLOCKED_MARKERS if m.lower() in text.lower()]
+    return ("blocked", hits[:5]) if hits else ("done", None)
 
 
 def reclaim(root):
     n = 0
     for job in load_jobs(root, "running"):
-        pid = job.get("pid")
+        job["last_checked"] = datetime.now(TZ).isoformat()
         alive = False
-        if pid:
+        if job.get("pid"):
             try:
-                os.kill(int(pid), 0)
+                os.kill(int(job["pid"]), 0)
                 alive = True
-            except OSError:
-                alive = False
+            except (OSError, ValueError, TypeError):
+                pass
         exit_p = remote_dir(job["id"]) / "exit"
         if alive and not exit_p.exists():
+            write_job(root, "running", job)
             continue
-        if exit_p.exists():
-            try:
-                job["exit"] = int(exit_p.read_text().strip() or "1")
-            except ValueError:
-                job["exit"] = 1
-        else:
-            job["exit"] = 1
+        try:
+            job["exit"] = int(exit_p.read_text().strip())
+        except (OSError, ValueError):
+            job["exit"] = None
         conc = remote_dir(job["id"]) / "conclusion.txt"
         job["conclusion"] = str(conc) if conc.exists() else None
-        status, hits = classify_outcome(job.get("exit"), job.get("conclusion"))
+        status, hits = classify_outcome(job["exit"], job["conclusion"])
         job["status"] = status
+        if status == "unknown":
+            job["outcome_reason"] = "worker_timeout" if job["exit"] == 124 else "missing_or_invalid_exit"
         if hits:
             job["block_reasons"] = hits
         job["finished_at"] = datetime.now(TZ).isoformat()
-        remove_job(root, "running", job["id"])
         write_job(root, "done", job)
+        remove_job(root, "running", job["id"])
         n += 1
     return n
 
 
 def launch(root, job, pool):
+    fake = os.environ.get("CS_TEST_FAKE_WORKER") == "1"
+    if fake and (not (os.environ.get("CS_HOME") or os.environ.get("CODING_SCHEDULER_HOME"))
+                 or home() == (Path.home() / ".coding-scheduler").resolve()):
+        raise ValueError("CS_TEST_FAKE_WORKER requires an isolated CS_HOME")
     model, effort = model_for(pool, job.get("tier") or "M")
+    model = job.get("model") or model
     jd = remote_dir(job["id"])
     jd.mkdir(parents=True, exist_ok=True)
-    prompt_path = Path(job["prompt_file"])
-    body = prompt_path.read_text() if prompt_path.exists() else ""
-    prompt = NO_SUB + body
-    (jd / "prompt.md").write_text(prompt)
-    cwd = job.get("cwd") or str(Path.home())
-    log = jd / "log"
-    conclusion = jd / "conclusion.txt"
-    exit_file = jd / "exit"
-
-    # Feed prompt from jd/prompt.md via a tiny on-disk run.sh so the outer
-    # nohup/argv never embeds the body (nested json.dumps caused R75-p1 ARG_MAX).
+    body = Path(job["prompt_file"]).read_text()
     prompt_on_disk = jd / "prompt.md"
-    run_sh = jd / "run.sh"
-    if pool == "codex":
-        run_sh.write_text(
-            "#!/bin/bash\nset -euo pipefail\n"
-            "cd %s\n"
-            "codex exec --dangerously-bypass-approvals-and-sandbox -m %s -c model_reasoning_effort=%s -C %s -o %s - < %s\n"
-            "echo $? > %s\n"
-            % (
-                json.dumps(cwd),
-                model,
-                json.dumps(effort),
-                json.dumps(cwd),
-                json.dumps(str(conclusion)),
-                json.dumps(str(prompt_on_disk)),
-                json.dumps(str(exit_file)),
-            )
-        )
+    prompt_on_disk.write_text(NO_SUB + body)
+    cwd = job.get("cwd") or str(Path.home())
+    log, conclusion, exit_file = jd / "log", jd / "conclusion.txt", jd / "exit"
+    # A manually reused ID must not inherit old completion evidence.
+    exit_file.unlink(missing_ok=True)
+    conclusion.unlink(missing_ok=True)
+    base_sha = git_output(cwd, "rev-parse", "HEAD")
+    job.update(pool=pool, model=model, effort=effort, base_sha=base_sha,
+               started_at=datetime.now(TZ).isoformat(), conclusion=str(conclusion), log=str(log))
+    # Fake worker is synchronous, requires an explicit isolated state root, and
+    # never executes a caller-supplied command or a model CLI.
+    if fake:
+        conclusion.write_text("Fake worker completed.\n")
+        log.write_text("test fake worker\n")
+        exit_file.write_text("0\n")
+        job.update(status="running", pid=None)
     else:
-        # murmurant native verify rejects sonnet/opus effort=medium + thinking=adaptive;
-        # verified includes high+adaptive. Coerce medium→high until R91 deploys.
-        cc_effort = "high" if effort == "medium" else effort
-        # Claude has no stdin-prompt mode that skips argv; keep body in a second
-        # file and expand inside run.sh (still not on the outer nohup argv).
-        run_sh.write_text(
-            "#!/bin/bash\nset -euo pipefail\n"
-            "cd %s\n"
-            "PROMPT=$(cat %s)\n"
-            "claude -p --dangerously-skip-permissions --model %s --effort %s \"$PROMPT\" > %s 2>> %s\n"
-            "echo $? > %s\n"
-            % (
-                json.dumps(cwd),
-                json.dumps(str(prompt_on_disk)),
-                model,
-                cc_effort,
-                json.dumps(str(conclusion)),
-                json.dumps(str(log)),
-                json.dumps(str(exit_file)),
-            )
-        )
-    run_sh.chmod(0o755)
-    full = "nohup %s > %s 2>&1 & echo $!" % (json.dumps(str(run_sh)), json.dumps(str(log)))
-    proc = subprocess.run(["bash", "-lc", full], capture_output=True, text=True)
-    lines = (proc.stdout or "").strip().splitlines()
-    try:
-        pid = int(lines[-1]) if lines else None
-    except ValueError:
-        pid = None
-    if not pid:
-        job["status"] = "failed"
-        job["exit"] = 1
-        job["finished_at"] = datetime.now(TZ).isoformat()
-        remove_job(root, "queue", job["id"])
-        write_job(root, "done", job)
-        return job
-
-    (jd / "pid").write_text(str(pid) + "\n")
-    job["pool"] = pool
-    job["pid"] = pid
-    job["status"] = "running"
-    job["model"] = model
-    job["effort"] = effort
-    job["started_at"] = datetime.now(TZ).isoformat()
-    job["conclusion"] = str(conclusion)
-    remove_job(root, "queue", job["id"])
+        q = shlex.quote
+        if pool == "codex":
+            command = ("codex exec --dangerously-bypass-approvals-and-sandbox -m %s "
+                       "-c %s -C %s -o %s - < %s" %
+                       (q(model), q("model_reasoning_effort=" + effort), q(cwd),
+                        q(str(conclusion)), q(str(prompt_on_disk))))
+        else:
+            cc_effort = "high" if effort == "medium" else effort
+            command = ("claude -p --dangerously-skip-permissions --model %s --effort %s "
+                       '\"$(cat %s)\" > %s' %
+                       (q(model), q(cc_effort), q(str(prompt_on_disk)), q(str(conclusion))))
+        run_sh = jd / "run.sh"
+        # EXIT trap records nonzero command/cd failures too (old set -e lost them).
+        trap = ('rc=$?; printf "%s\\n" "$rc" > ' + q(str(exit_file) + ".tmp") +
+                "; mv " + q(str(exit_file) + ".tmp") + " " + q(str(exit_file)))
+        run_sh.write_text("#!/bin/bash\nset -euo pipefail\n" +
+                          "trap " + q(trap) + " EXIT\n" +
+                          "cd " + q(cwd) + "\n" + command + "\n")
+        with log.open("w") as output:
+            proc = subprocess.Popen(["bash", str(run_sh)], stdout=output,
+                                    stderr=subprocess.STDOUT, start_new_session=True)
+        job.update(status="running", pid=proc.pid)
+        (jd / "pid").write_text(str(proc.pid) + "\n")
     write_job(root, "running", job)
+    remove_job(root, "queue", job["id"])
     return job
+
+
+def quota_reasons(root, pools):
+    """Optional local snapshot. Absent file preserves legacy scheduling."""
+    path = root / "quota.json"
+    if not path.exists():
+        return []
+    try:
+        quotas = json.loads(path.read_text())
+        if not isinstance(quotas, dict):
+            quotas = {}
+    except (OSError, ValueError):
+        quotas = {}
+    reasons = []
+    for pool in pools:
+        value = quotas.get(pool)
+        if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) and value >= 0):
+            if value == 0:
+                reasons.append({"type": "quota_exhausted", "pool": pool, "remaining": 0})
+        else:
+            reasons.append({"type": "quota_unknown", "pool": pool})
+    return reasons
+
+
+def check_queue(root, job, running, resolver=None):
+    """Evaluate every independent blocker even if a lock already blocks launch."""
+    conflicts = file_conflict(job, running, resolver)
+    if conflicts:
+        job["blocked_by"] = conflicts
+    else:
+        job.pop("blocked_by", None)
+    c = counts(running)
+    cs, ccs = score(job, c, area_counts(running))
+    job["affinity"] = {"codex": cs, "cc": ccs}
+    pool, reasons = pick_pool(cs, ccs, CODEX_CAP - c["codex"], CC_CAP - c["cc"])
+    reasons = [dict(item, type="lock") for item in conflicts] + reasons
+    # Quota applies to the selected pool; if capacity prevents selection, report
+    # all affinity-eligible pools, so a pool failure does not hide quota failures.
+    primary = "codex" if cs >= ccs else "cc"
+    secondary = "cc" if primary == "codex" else "codex"
+    eligible = [pool] if pool else [primary] + ([secondary] if job["affinity"][secondary] >= 45 else [])
+    reasons += quota_reasons(root, eligible)
+    job["queue_reasons"] = reasons
+    job["last_checked"] = datetime.now(TZ).isoformat()
+    return pool
+
+
+def reason_text(reasons):
+    texts = []
+    for reason in reasons:
+        kind = reason.get("type")
+        if kind == "lock":
+            text = "%s 占用 %s (%s锁)" % (reason["job"], reason["mine"], reason["kind"])
+        elif kind == "pool_full":
+            text = "%s 池满" % reason["pool"]
+        elif kind == "spill_insufficient":
+            text = "%s 副池分数 %s<%s" % (reason["pool"], reason["score"], reason["minimum"])
+        elif kind == "quota_unknown":
+            text = "%s 额度未知" % reason["pool"]
+        elif kind == "quota_exhausted":
+            text = "%s 额度耗尽" % reason["pool"]
+        elif kind == "awaiting_tick":
+            text = "等待 tick 调度"
+        elif kind == "launch_error":
+            text = "启动失败：" + reason["detail"]
+        else:
+            text = str(kind)
+        texts.append(text)
+    return "；".join(texts) or "—"
 
 
 def tick(root, resolver=None):
@@ -239,7 +363,6 @@ def tick(root, resolver=None):
     running = load_jobs(root, "running")
     queued = load_jobs(root, "queue")
     c = counts(running)
-    by_area = area_counts(running)
     started = []
 
     def sk(j):
@@ -250,29 +373,24 @@ def tick(root, resolver=None):
         )
 
     for job in sorted(queued, key=sk):
-        conflicts = file_conflict(job, running, resolver)
-        if conflicts:
-            if job.get("blocked_by") != conflicts:
-                job["blocked_by"] = conflicts
-                write_job(root, "queue", job)
-            continue
-        if "blocked_by" in job:
-            del job["blocked_by"]
-            write_job(root, "queue", job)
-        cs, ccs = score(job, c, by_area)
-        job["affinity"] = {"codex": cs, "cc": ccs}
-        pool = pick_pool(cs, ccs, CODEX_CAP - c["codex"], CC_CAP - c["cc"])
-        if not pool:
+        pool = check_queue(root, job, running, resolver)
+        if job["queue_reasons"]:
             write_job(root, "queue", job)
             continue
-        launch(root, job, pool)
+        try:
+            launch(root, job, pool)
+        except (OSError, ValueError) as exc:
+            job["queue_reasons"] = [{"type": "launch_error", "detail": str(exc)}]
+            write_job(root, "queue", job)
+            continue
         started.append(job["id"])
         running = load_jobs(root, "running")
         c = counts(running)
-        by_area = area_counts(running)
 
     write_board(root)
-    return {"reclaimed": reclaimed, "started": started, "counts": c}
+    return {"reclaimed": reclaimed, "started": started, "counts": c,
+            "queued": [{"id": j["id"], "queue_reasons": j.get("queue_reasons", []),
+                        "last_checked": j.get("last_checked")} for j in load_jobs(root, "queue")]}
 
 
 def write_board(root):
@@ -285,15 +403,15 @@ def write_board(root):
         "更新：%s UTC+8" % datetime.now(TZ).strftime("%Y-%m-%d %H:%M"),
         "运行计数：Codex `%s/%s` · CC `%s/%s`" % (c["codex"], CODEX_CAP, c["cc"], CC_CAP),
         "",
-        "| id | project | area | tier | pool | status | cwd |",
-        "|---|---|---|---|---|---|---|",
+        "| id | project | area | tier | pool | status | cwd | 原因 |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     rows = running + queued
     if not rows:
-        lines.append("| — | — | — | — | — | idle | — |")
+        lines.append("| — | — | — | — | — | idle | — | — |")
     for j in rows:
         lines.append(
-            "| %s | %s | %s | %s | %s | %s | `%s` |"
+            "| %s | %s | %s | %s | %s | %s | `%s` | %s |"
             % (
                 j.get("id", ""),
                 j.get("project", ""),
@@ -302,6 +420,7 @@ def write_board(root):
                 j.get("pool") or "-",
                 j.get("status", ""),
                 j.get("cwd", ""),
+                reason_text(j.get("queue_reasons", [])).replace("|", "\\|").replace("\n", " "),
             )
         )
     lines.append("")
@@ -317,20 +436,21 @@ def write_board(root):
 
 
 
-def doctor_checks(cwd=None):
+def doctor_checks(cwd=None, pool=None):
     """Preflight for common hard-fail environments. Returns list of {name,ok,detail}."""
     import shutil
     import socket
 
     checks = []
 
-    def add(name, ok, detail):
-        checks.append({"name": name, "ok": bool(ok), "detail": detail})
+    def add(name, ok, detail, required=False):
+        checks.append({"name": name, "ok": bool(ok), "detail": detail,
+                       "level": "OK" if ok else ("FAIL" if required else "WARN")})
 
     codex = shutil.which("codex")
     claude = shutil.which("claude")
-    add("codex_cli", bool(codex), codex or "not on PATH")
-    add("claude_cli", bool(claude), claude or "not on PATH")
+    add("codex_cli", bool(codex), codex or "not on PATH", pool == "codex")
+    add("claude_cli", bool(claude), claude or "not on PATH", pool == "cc")
 
     try:
         socket.getaddrinfo("github.com", 443)
@@ -340,8 +460,8 @@ def doctor_checks(cwd=None):
 
     if cwd:
         cpath = Path(cwd).expanduser()
-        if not cpath.exists():
-            add("cwd_exists", False, str(cpath))
+        if not cpath.is_dir():
+            add("cwd_exists", False, str(cpath), True)
             return checks
         add("cwd_exists", True, str(cpath))
         try:
@@ -363,7 +483,7 @@ def doctor_checks(cwd=None):
                     probe.unlink(missing_ok=True)
                     add("git_writable", True, str(gdir))
                 except OSError as e:
-                    add("git_writable", False, str(e))
+                    add("git_writable", False, str(e), True)
         except Exception as e:
             add("git_writable", False, str(e))
 

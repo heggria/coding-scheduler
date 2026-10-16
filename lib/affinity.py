@@ -12,6 +12,7 @@ AREA = {
     "test": (75, 55),
     "ops-script": (60, 60),
     "review": (50, 50),
+    "research": (60, 60),
 }
 TIER = {"L": (50, 70), "M": (70, 55), "H": (80, 65)}
 
@@ -50,16 +51,25 @@ def score(job, running_counts, running_by_area):
 
 
 def pick_pool(codex_s, cc_s, free_codex, free_cc):
+    """Return (pool, reasons); spill constraints are reported independently."""
     primary = "codex" if codex_s >= cc_s else "cc"
     secondary = "cc" if primary == "codex" else "codex"
     secondary_s = cc_s if primary == "codex" else codex_s
     primary_free = free_codex if primary == "codex" else free_cc
     secondary_free = free_cc if primary == "codex" else free_codex
     if primary_free > 0:
-        return primary
+        return primary, []
     if secondary_free > 0 and secondary_s >= 45:
-        return secondary
-    return None
+        return secondary, []
+    context = {"primary": primary, "secondary": secondary,
+               "scores": {"codex": codex_s, "cc": cc_s}}
+    reasons = [dict(context, type="pool_full", pool=primary, free=primary_free)]
+    if secondary_free <= 0:
+        reasons.append(dict(context, type="pool_full", pool=secondary, free=secondary_free))
+    if secondary_s < 45:
+        reasons.append(dict(context, type="spill_insufficient", pool=secondary,
+                            score=secondary_s, minimum=45))
+    return None, reasons
 
 
 def model_for(pool, tier):

@@ -9,7 +9,8 @@ cs submit --project mm --area backend --tier H \
   --cwd ~/code/worktrees/x --prompt ./job.md --files src/foo.py \
   [--lock-shared src/core.py,src/credits.py] [--pin codex] [--tick]
 cs tick
-cs status [--json]
+cs status [<id>] [--json]
+cs wait <id> [<id>...] [--timeout SEC] [--lines N]
 cs cancel <id>
 cs board
 cs doctor
@@ -42,7 +43,7 @@ submit 保存含原始输入与解析结果的 `lock_ctx`。旧任务只有 `cwd
 tick 时惰性解析，缺少 `shared_files` 视为空；无需改写历史任务。锁输入变化后重新解析。
 `file_conflict` 返回结构化列表（无冲突为空），含 `job`、`mine`、`theirs`、`kind`
 （任一方共享则为 `shared`，否则 `write`）与 `repo`。排队任务的 `blocked_by`
-只在冲突变化时写入，解锁后清除。
+内容只在冲突变化时改变，解锁后清除；每次检查仍保存 last_checked。
 
 **mm / OD 提交方迁移**：同仓库不同 worktree 修改同一文件，现在默认可以并行。
 如核心文件在合并时仍需串行，请显式增加 `--lock-shared`；已有 `--files` 不会自动
@@ -60,3 +61,63 @@ tick 时惰性解析，缺少 `shared_files` 视为空；无需改写历史任�
 ## Bot 用法
 
 只 `cs submit` / `cs tick` / `cs status`，不要自己直接 `codex exec` 抢槽。
+
+## A / D 与低 token 扩展（2026-10-16）
+
+本次真相源：任务 A（排队原因）、D（bot 接口）及低 token 功能要求，基线 `cf564b4`。
+范围不含自动 worktree、自动续跑、自动部署和远端额度探测。
+
+| 行为 | 实现 | 验证 |
+|---|---|---|
+| A：每次完整检查锁/池/spill/额度，保存 ISO 检查时间 | `check_queue`、`pick_pool`、`tick`；board 原因列 | `test_tick_all_lock_capacity_spill_and_quota_reasons`、quota/清除原因测试 |
+| D：版本化 JSON、幂等、unknown、历史单摘要 | CLI 统一 emit/errors；根级 flock；reclaim；job_summary | schema/idempotency/unknown/status 测试 |
+| 等待多单，限时精简摘要 | wait 持锁回收后释放锁等待，返回终态或 124 | wait 多单、完成信号、超时、旧单测试 |
+| prompt 来源、模板与模型 | submit 持久化组合 prompt，launch 注入硬规则和模型参数 | 三种输入/模板开关/模型与 shell stub 测试 |
+| 可隔离状态与产物、doctor 降级 | CS_HOME 与旧环境变量；同步 fake worker；检查 level | 隔离保护/旧变量/doctor 测试；隔离复制冒烟 |
+
+### 状态与写入
+
+所有命令支持 `--json`（含参数/运行错误），响应版本为 `schema_version: "1"`。
+根级 `.lock` 串行化 CLI 的提交/回收/调度/取消；JSON 用临时文件替换，避免半写。
+wait 每次仅在回收和读取时持锁；不发起调度。等待完成退出 0，不代表各单成功；
+等待超时退出 124，附当前摘要，不取消任务也不强改 unknown。
+
+queue/running/done 目录保留，done 下可保存 done/failed/blocked/cancelled/unknown。
+没有有效 exit 且 PID 已消失，或 exit=124 表示 worker 超时，结果为 unknown；
+exit=0 无有效 conclusion 为 blocked。旧记录缺少新增字段按空/None 读取，不强制迁移。
+真实 worker 脚本用 EXIT trap 写退出码并原子替换 exit，非零退出不再丢失结果文件。
+
+### 排队解释与额度边界
+
+每个 queued 单无论先遇到什么阻塞，都评估全部独立约束并写 queue_reasons。
+lock 原因直接携带 B 的 blocked_by 项（job/mine/theirs/kind/repo）；blocked_by 仅在
+冲突变化时改变内容，但每次仍保存 last_checked。running 在回收检查时也更新该时间。
+pick_pool 返回 `(pool, reasons)`，失败原因含 primary/secondary/scores，spill 最低分仍为 45。
+submit 未指定 --tick 保留不启动语义，追加 awaiting_tick；指定时返回自己的状态/原因与调度结果。
+
+代码基线没有 quota 数据源，因此使用可选状态根 quota.json 的池→剩余额度快照。
+无快照保持旧行为；有快照时选中池的 0 / null或缺失分别对应耗尽 / 未知，阻止启动。
+容量无可选池时报告所有亲和度合格池的额度问题，以免池满隐藏额度原因。
+不自动刷新/扣减，不新增因额度而 spill 的策略。无远端真实额度验收声明。
+
+### 摘要与模板
+
+start 记录 cwd HEAD 为 base_sha；wait / status <id> 在 cwd 对比该 SHA 到当前工作区，
+提供 diff_stat 和 changed_files，包含之后提交的改动（不是只比较当前 HEAD）。
+非 Git 或旧单无 SHA 时省略。统计是读取时该 cwd 的实时快照，非每单独占的改动归因；
+同 cwd 并行单和任务开始前已有的脏改动也可能出现在统计内，不含 untracked。
+conclusion 仅输出前 N 行，PR 链接扫描全文并去重，支持 https://github.com/.../pull/N。
+
+模板从 `<状态根>/projects/<project>.md` 读取并在 submit 时快照到 prompt_file，
+后改模板不影响已排单；--no-template 可关闭。模型参数按 shell 参数引用传给 worker，
+未指定保持默认；禁止子 agent 的硬规则仍统一置于最终 prompt 开头。
+
+### 路径和检查
+
+CS_HOME > CODING_SCHEDULER_HOME > ~/.coding-scheduler。未指定环境变量时产物仍在
+~/.remote-jobs；显式隔离根则使用该根 workers/，绝不复用生产 worker 目录。
+CS_TEST_FAKE_WORKER=1 仅在非默认的显式根启用，完全同步，不执行模型 CLI。
+冒烟副本先归档 queue/running/done 与 quota，避免操作历史生产 PID 或启动旧任务。
+
+doctor 增加 level=OK/WARN/FAIL；非 Git、无关池 CLI、DNS、信任提示只警告。
+--pool 选中 CLI 缺失、无效 cwd 或 Git 元数据写入失败为硬失败。

@@ -8,7 +8,9 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import sys
+import time
 from contextlib import contextmanager
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -121,6 +123,71 @@ def git_output(cwd, *args):
         return None
 
 
+def process_group_members(pgid):
+    """Return (pid, state) pairs, including zombies, from a fresh snapshot."""
+    try:
+        result = subprocess.run(["ps", "-axo", "pid=,pgid=,stat="],
+                                capture_output=True, text=True, check=True, timeout=5)
+    except subprocess.SubprocessError as exc:
+        raise OSError("cannot inspect process group %s: %s" % (pgid, exc)) from exc
+    members = []
+    for line in result.stdout.splitlines():
+        pid, group, state = line.split()
+        if int(group) == pgid:
+            members.append((int(pid), state))
+    return members
+
+
+def kill_worker_group(pgid):
+    """Terminate a worker session; return evidence only after no live members remain."""
+    pgid = int(pgid)
+    if pgid <= 1 or pgid == os.getpgrp():
+        raise ValueError("refusing unsafe worker process group: %s" % pgid)
+    grace = float(os.environ.get("CS_CANCEL_GRACE", "5"))
+    if not math.isfinite(grace) or grace < 0:
+        raise ValueError("CS_CANCEL_GRACE must be a finite nonnegative number")
+    evidence = {"cancel_killed_pids": [pid for pid, _ in process_group_members(pgid)],
+                "cancel_signal": None}
+
+    def alive():
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # macOS returns EPERM for a group that holds only zombies.
+            pass
+        # Unreaped zombies cannot execute or receive signals; do not wait on them.
+        return any(not state.startswith("Z") for _, state in process_group_members(pgid))
+
+    def send(sig):
+        try:
+            os.killpg(pgid, sig)
+            evidence["cancel_signal"] = sig.name
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            if alive():
+                raise
+
+    def wait_gone(seconds):
+        deadline = time.monotonic() + seconds
+        while alive():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.05, remaining))
+        return True
+
+    if alive():
+        send(signal.SIGTERM)
+        if not wait_gone(grace):
+            send(signal.SIGKILL)
+            if not wait_gone(5):
+                raise OSError("worker process group %s remains alive after SIGKILL" % pgid)
+    return evidence
+
+
 def job_summary(job, lines=20):
     """Bounded bot output; old records need no migration."""
     started = job.get("started_at")
@@ -152,6 +219,9 @@ def job_summary(job, lines=20):
                             "worktree": job.get("cwd")},
               "queue_reasons": job.get("queue_reasons", []),
               "last_checked": job.get("last_checked")}
+    for field in ("pgid", "cancel_killed_pids", "cancel_signal"):
+        if field in job:
+            result[field] = job[field]
     if job.get("outcome_reason"):
         result["outcome_reason"] = job["outcome_reason"]
     if job.get("block_reasons"):
@@ -255,7 +325,7 @@ def launch(root, job, pool):
         conclusion.write_text("Fake worker completed.\n")
         log.write_text("test fake worker\n")
         exit_file.write_text("0\n")
-        job.update(status="running", pid=None)
+        job.update(status="running", pid=None, pgid=None)
     else:
         q = shlex.quote
         if pool == "codex":
@@ -278,7 +348,7 @@ def launch(root, job, pool):
         with log.open("w") as output:
             proc = subprocess.Popen(["bash", str(run_sh)], stdout=output,
                                     stderr=subprocess.STDOUT, start_new_session=True)
-        job.update(status="running", pid=proc.pid)
+        job.update(status="running", pid=proc.pid, pgid=proc.pid)
         (jd / "pid").write_text(str(proc.pid) + "\n")
     write_job(root, "running", job)
     remove_job(root, "queue", job["id"])

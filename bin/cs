@@ -19,7 +19,7 @@ sys.path.insert(0, str(LIB))
 from affinity import CC_CAP, CODEX_CAP
 from locks import directory_locks, lock_context
 from core import (TZ, check_queue, counts, doctor_checks, ensure, find_job, home,
-                  job_summary, load_jobs, reason_text, reclaim, remove_job,
+                  job_summary, kill_worker_group, load_jobs, reason_text, reclaim, remove_job,
                   state_lock, tick, write_board, write_job)
 
 
@@ -207,11 +207,11 @@ def cmd_cancel(args):
         if not path.exists():
             continue
         job = json.loads(path.read_text())
-        if folder == "running" and job.get("pid"):
-            try:
-                os.kill(int(job["pid"]), 15)
-            except OSError:
-                pass
+        if folder == "running":
+            # Older workers also launched as session leaders, but only stored pid.
+            pgid = job.get("pgid") or job.get("pid")
+            job.update(kill_worker_group(pgid) if pgid else
+                       {"cancel_killed_pids": [], "cancel_signal": None})
         job.update(status="cancelled", finished_at=datetime.now(TZ).isoformat(), queue_reasons=[])
         if args.superseded_by:
             job["superseded_by"] = args.superseded_by

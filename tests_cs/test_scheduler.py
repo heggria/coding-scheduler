@@ -6,9 +6,11 @@ import os
 from pathlib import Path
 import runpy
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -425,6 +427,92 @@ class SchedulerTests(unittest.TestCase):
                 self.assertEqual(Path(job["prompt_file"]).read_text(), original_prompt)
                 self.assertFalse((self.root / "queue" / (jid + ".prompt.md")).exists())
 
+    def cancel_process_tree(self, ignore_term):
+        ready = self.base / "ready"
+        script = self.base / "worker.sh"
+        script.write_text("#!/bin/bash\n" + ("trap '' TERM\n" if ignore_term else "") +
+                          'if [ "${1:-}" = child ]; then\n'
+                          '  sleep 60 &\n'
+                          '  printf "%s %s\\n" "$$" "$!" > ' + shlex.quote(str(ready)) + '\n'
+                          '  wait\nelse\n  bash "$0" child &\n  wait\nfi\n')
+        worker = subprocess.Popen(["bash", str(script)], start_new_session=True)
+
+        def cleanup():
+            try:
+                os.killpg(worker.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            worker.wait(timeout=5)
+
+        self.addCleanup(cleanup)
+        deadline = time.monotonic() + 5
+        while not ready.exists() or not ready.read_text().strip():
+            self.assertLess(time.monotonic(), deadline, "fake worker did not become ready")
+            time.sleep(0.01)
+        descendants = [int(pid) for pid in ready.read_text().split()]
+        self.assertEqual(len(descendants), 2)
+        expected_pids = sorted([worker.pid] + descendants)
+        # Exercise legacy pid fallback as well as explicit pgid records.
+        fields = {"pgid": worker.pid} if ignore_term else {}
+        self.record("tree", "running", status="running", pid=worker.pid, **fields)
+        started = time.monotonic()
+        with patch.dict(os.environ, {"CS_CANCEL_GRACE": "0.2"}):
+            result = json.loads(self.cli("cancel", "tree", "--json"))["job"]
+        elapsed = time.monotonic() - started
+        worker.wait(timeout=5)
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(sorted(result["cancel_killed_pids"]), expected_pids)
+        self.assertEqual(result["cancel_signal"], "SIGKILL" if ignore_term else "SIGTERM")
+        if ignore_term:
+            self.assertGreaterEqual(elapsed, 0.2)
+        stored = core.find_job(self.root, "tree")
+        self.assertEqual(stored["cancel_killed_pids"], result["cancel_killed_pids"])
+        self.assertEqual(stored["cancel_signal"], result["cancel_signal"])
+        # Zombies are dead too, even when the host's init has not reaped them yet.
+        self.assertFalse([pid for pid, state in core.process_group_members(worker.pid)
+                          if not state.startswith("Z")])
+        for pid in expected_pids:
+            state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                                   capture_output=True, text=True, timeout=5).stdout.strip()
+            self.assertTrue(not state or state.startswith("Z"), (pid, state))
+
+    def test_cancel_terminates_child_and_grandchild(self):
+        self.cancel_process_tree(ignore_term=False)
+
+    def test_cancel_escalates_term_ignoring_tree_to_sigkill(self):
+        self.cancel_process_tree(ignore_term=True)
+
+    def test_cancel_already_dead_group(self):
+        worker = subprocess.Popen(["bash", "-c", "exit 0"], start_new_session=True)
+        worker.wait(timeout=5)
+        self.record("dead", "running", status="running", pid=worker.pid, pgid=worker.pid)
+        job = json.loads(self.cli("cancel", "dead", "--json"))["job"]
+        self.assertEqual(job["status"], "cancelled")
+        self.assertEqual(job["cancel_killed_pids"], [])
+        self.assertIsNone(job["cancel_signal"])
+
+    def test_cancel_permission_error_preserves_running_job(self):
+        self.record("denied", "running", status="running", pid=123, pgid=123)
+        with patch.object(core, "process_group_members", return_value=[(123, "S")]), \
+                patch.object(core.os, "killpg", side_effect=PermissionError("denied")):
+            result = json.loads(self.cli("cancel", "denied", "--json", expected=2))
+        self.assertIn("denied", result["error"])
+        self.assertEqual(core.find_job(self.root, "denied")["status"], "running")
+        self.assertFalse((self.root / "done/denied.json").exists())
+
+    def test_cancel_surviving_sigkill_preserves_running_job(self):
+        self.record("stuck", "running", status="running", pid=123, pgid=123)
+        with patch.dict(os.environ, {"CS_CANCEL_GRACE": "0"}), \
+                patch.object(core, "process_group_members", return_value=[(123, "S")]), \
+                patch.object(core.os, "killpg") as killpg, \
+                patch.object(core.time, "monotonic", side_effect=[0, 1, 1, 7]):
+            result = json.loads(self.cli("cancel", "stuck", "--json", expected=2))
+        self.assertIn("remains alive after SIGKILL", result["error"])
+        self.assertIn(unittest.mock.call(123, signal.SIGTERM), killpg.call_args_list)
+        self.assertIn(unittest.mock.call(123, signal.SIGKILL), killpg.call_args_list)
+        self.assertEqual(core.find_job(self.root, "stuck")["status"], "running")
+        self.assertFalse((self.root / "done/stuck.json").exists())
+
     def test_status_read_only_preserves_all_state_and_default_still_reclaims(self):
         self.submit("finished", "--prompt-text", "goal", "--tick")
         self.record("live", "running", status="running", pid=os.getpid())
@@ -620,6 +708,7 @@ class SchedulerTests(unittest.TestCase):
             script = core.remote_dir(jid) / "run.sh"
             self.assertIn(shlex.quote(dangerous), script.read_text())
             self.assertTrue(popen.call_args.kwargs["start_new_session"])
+            self.assertEqual(core.find_job(self.root, jid)["pgid"], 123)
             fake_bin = self.base / ("fake-" + pool)
             fake_bin.mkdir()
             executable = fake_bin / ("codex" if pool == "codex" else "claude")

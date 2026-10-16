@@ -16,8 +16,8 @@ from pathlib import Path
 LIB = Path(__file__).resolve().parents[1] / "lib"
 sys.path.insert(0, str(LIB))
 
-from affinity import CC_CAP, CODEX_CAP
 from locks import directory_locks, lock_context
+import core
 from core import (TZ, check_queue, counts, doctor_checks, ensure, find_job, home,
                   job_summary, kill_worker_group, load_jobs, reason_text, reclaim, remove_job,
                   state_lock, tick, write_board, write_job)
@@ -162,11 +162,12 @@ def cmd_status(args):
         return 0
     running, queued = load_jobs(root, "running"), load_jobs(root, "queue")
     c = counts(running)
+    caps = core.reload_caps(root)
     if args.json:
-        emit({"counts": c, "caps": {"codex": CODEX_CAP, "cc": CC_CAP},
+        emit({"counts": c, "caps": caps,
               "reclaimed": reclaimed, "running": running, "queued": queued})
     else:
-        print("Codex %s/%s  CC %s/%s" % (c["codex"], CODEX_CAP, c["cc"], CC_CAP))
+        print("Codex %s/%s  CC %s/%s" % (c["codex"], caps["codex"], c["cc"], caps["cc"]))
         print("running=%s queued=%s reclaimed=%s" % (len(running), len(queued), reclaimed))
         for job in running + queued:
             print("  [%s] %s tier=%s pool=%s area=%s %s" %

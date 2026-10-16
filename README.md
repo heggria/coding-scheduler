@@ -74,6 +74,12 @@ launchd 将 stdout 追加重定向到同一 tick.log 时只记 stdout 一份，�
 目录锁按解析后的目录在每单提交时只警告一次，tick 不重复警告；
 锁原因按占用 job、当前文件和 kind 去重，board 对历史重复原因也只显示一次。
 
+## 池上限（caps）
+
+Codex/CC 并发上限默认 24/6，运行时读取 `{CS_HOME}/caps.json`（`{"codex":24,"cc":6}`，正整数），
+其次环境变量 `CS_CODEX_CAP` / `CS_CC_CAP`，最后用默认值。tick、status、board、dashboard `/api/state`
+每次重读，改 caps.json 无需改代码。该文件是运行时状态，不提交。
+
 ## 项目模板与额度快照
 
 模板放在状态根目录 `projects/<project>.md`，默认 `~/.coding-scheduler/projects/<project>.md`。

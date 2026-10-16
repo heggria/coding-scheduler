@@ -122,6 +122,13 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(data["done"][0]["elapsed_seconds"], 180)
         self.assertEqual(data["done"][0]["exit"], 7)
 
+    def test_snapshot_reloads_caps_json(self):
+        self.assertEqual(dashboard.snapshot()["caps"]["cc"], 6)
+        (self.root / "caps.json").write_text('{"codex": 11, "cc": 4}')
+        self.assertEqual(dashboard.snapshot()["caps"], {"codex": 11, "cc": 4})
+        (self.root / "caps.json").unlink()
+        self.assertEqual(dashboard.snapshot()["caps"], {"codex": 24, "cc": 6})
+
     def test_snapshot_never_reclaims_locks_schedules_or_writes(self):
         self.record("dead", "running", pid=None)
         self.record("waiting", "queue")

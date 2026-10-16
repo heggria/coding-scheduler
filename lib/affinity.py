@@ -1,8 +1,53 @@
 """Affinity + caps for cs CLI."""
 from __future__ import annotations
 
-CODEX_CAP = 16
-CC_CAP = 6
+import json
+import os
+from pathlib import Path
+
+DEFAULT_CAPS = {"codex": 24, "cc": 6}
+# Import-time defaults; reload_caps() refreshes them from caps.json / env.
+CODEX_CAP = DEFAULT_CAPS["codex"]
+CC_CAP = DEFAULT_CAPS["cc"]
+
+
+def _positive_int(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value.isdigit():
+            return None
+        value = int(value)
+    if isinstance(value, int) and value > 0:
+        return value
+    return None
+
+
+def load_caps(root=None):
+    """Resolve caps: {root}/caps.json, then CS_CODEX_CAP/CS_CC_CAP env, then defaults."""
+    if root is None:
+        root = (os.environ.get("CS_HOME") or os.environ.get("CODING_SCHEDULER_HOME")
+                or Path.home() / ".coding-scheduler")
+    try:
+        data = json.loads((Path(root).expanduser() / "caps.json").read_text())
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    caps = {}
+    for key, env in (("codex", "CS_CODEX_CAP"), ("cc", "CS_CC_CAP")):
+        caps[key] = (_positive_int(data.get(key)) or _positive_int(os.environ.get(env))
+                     or DEFAULT_CAPS[key])
+    return caps
+
+
+def reload_caps(root=None):
+    """Refresh module-level CODEX_CAP / CC_CAP; invalid entries fall through."""
+    global CODEX_CAP, CC_CAP
+    caps = load_caps(root)
+    CODEX_CAP, CC_CAP = caps["codex"], caps["cc"]
+    return caps
 
 AREA = {
     "backend": (90, 40),

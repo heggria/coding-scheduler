@@ -9,7 +9,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from affinity import CC_CAP, CODEX_CAP, model_for
+from affinity import model_for
+import core
 from core import TZ, counts, home, load_jobs, reason_text, remote_dir
 
 TAIL_BYTES = 8192
@@ -168,6 +169,7 @@ def snapshot(status_command=None):
     status_command is retained only for compatibility with bin/cs's call site.
     """
     root = home()
+    caps = core.reload_caps(root)
     folders = {folder: load_jobs(root, folder) for folder in ("queue", "running", "done")}
     seen = set()
     for folder in ("done", "running", "queue"):
@@ -207,7 +209,7 @@ def snapshot(status_command=None):
         if start and start <= now and finish >= cutoff:
             timeline.append(job)
     return {"schema_version": "1", "counts": counts(folders["running"]),
-            "caps": {"codex": CODEX_CAP, "cc": CC_CAP}, "reclaimed": 0,
+            "caps": caps, "reclaimed": 0,
             "running": folders["running"], "queued": folders["queue"],
             "dashboard": {"running": running, "queued": queued, "done": recent,
                           "completed": completed, "timeline": timeline,

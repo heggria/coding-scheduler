@@ -89,6 +89,39 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(reasons[2]["minimum"], 45)
         self.assertEqual(pick_pool(30, 80, 1, 0)[1][-1]["type"], "spill_insufficient")
 
+    def test_caps_default_file_env_and_cc_unchanged(self):
+        import affinity
+        with patch.dict(os.environ):
+            os.environ.pop("CS_CODEX_CAP", None)
+            os.environ.pop("CS_CC_CAP", None)
+            self.assertEqual(core.reload_caps(), {"codex": 24, "cc": 6})
+            self.assertEqual((affinity.CODEX_CAP, affinity.CC_CAP), (24, 6))
+            os.environ["CS_CODEX_CAP"] = "30"
+            os.environ["CS_CC_CAP"] = "bad"
+            self.assertEqual(core.reload_caps(), {"codex": 30, "cc": 6})
+            (self.root / "caps.json").write_text('{"codex": 8, "cc": 3}')
+            self.assertEqual(core.reload_caps(), {"codex": 8, "cc": 3})
+            self.assertEqual((core.CODEX_CAP, core.CC_CAP), (8, 3))
+            (self.root / "caps.json").write_text('{"codex": 0, "cc": true}')
+            self.assertEqual(core.reload_caps(), {"codex": 30, "cc": 6})
+            (self.root / "caps.json").write_text("not json")
+            self.assertEqual(core.reload_caps(), {"codex": 30, "cc": 6})
+            (self.root / "caps.json").unlink()
+            os.environ.pop("CS_CODEX_CAP")
+            self.assertEqual(core.reload_caps(), {"codex": 24, "cc": 6})
+
+    def test_import_defaults_and_status_picks_up_caps_json(self):
+        import affinity
+        self.assertEqual(affinity.DEFAULT_CAPS, {"codex": 24, "cc": 6})
+        (self.root / "caps.json").write_text('{"codex": 5}')
+        out = json.loads(self.cli("status", "--json", "--no-reclaim"))
+        self.assertEqual(out["caps"], {"codex": 5, "cc": 6})
+        (self.root / "caps.json").write_text('{"codex": 7, "cc": 2}')
+        out = json.loads(self.cli("status", "--json", "--no-reclaim"))
+        self.assertEqual(out["caps"], {"codex": 7, "cc": 2})
+        core.write_board(self.root)
+        self.assertIn("Codex `0/7` · CC `0/2`", (self.root / "board.md").read_text())
+
     def test_tick_all_lock_capacity_spill_and_quota_reasons(self):
         active = self.record("active", "running", status="running", pool="codex", pid=os.getpid(), files=["a.py"])
         active2 = self.record("active2", "running", status="running", pool="codex", pid=os.getpid(), files=["b.py"])

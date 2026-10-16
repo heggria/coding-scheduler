@@ -16,6 +16,7 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import affinity
 from affinity import CC_CAP, CODEX_CAP, model_for, pick_pool, score
 from locks import GitLockResolver, file_conflict
 
@@ -29,6 +30,24 @@ NO_SUB = (
 def home():
     return Path(os.environ.get("CS_HOME") or os.environ.get("CODING_SCHEDULER_HOME")
                 or Path.home() / ".coding-scheduler").expanduser().resolve()
+
+
+_LOADED_CAPS = {"codex": CODEX_CAP, "cc": CC_CAP}
+
+
+def reload_caps(root=None):
+    """Re-read caps (caps.json > env > defaults) into affinity and core globals.
+
+    A core global that was overridden since the last reload (e.g. a test patch)
+    is left alone so explicit assignments keep winning.
+    """
+    caps = affinity.reload_caps(root if root is not None else home())
+    g = globals()
+    for key, name in (("codex", "CODEX_CAP"), ("cc", "CC_CAP")):
+        if g[name] == _LOADED_CAPS[key]:
+            g[name] = caps[key]
+        _LOADED_CAPS[key] = caps[key]
+    return {"codex": g["CODEX_CAP"], "cc": g["CC_CAP"]}
 
 
 def ensure(root=None):
@@ -380,6 +399,7 @@ def quota_reasons(root, pools):
 
 def check_queue(root, job, running, resolver=None):
     """Evaluate every independent blocker even if a lock already blocks launch."""
+    reload_caps(root)
     conflicts = file_conflict(job, running, resolver)
     if conflicts:
         job["blocked_by"] = conflicts
@@ -428,6 +448,7 @@ def reason_text(reasons):
 
 def tick(root, resolver=None):
     root = ensure(root)
+    reload_caps(root)
     resolver = resolver if resolver is not None else GitLockResolver()
     reclaimed = reclaim(root)
     running = load_jobs(root, "running")
@@ -506,6 +527,7 @@ def log_tick(root, result):
 
 
 def write_board(root):
+    reload_caps(root)
     running = load_jobs(root, "running")
     queued = load_jobs(root, "queue")
     c = counts(running)

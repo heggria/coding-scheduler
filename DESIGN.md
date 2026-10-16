@@ -53,6 +53,12 @@ board 渲染时再按原因短句去重，兼容历史记录。
 
 ## 选池
 
+### Open Code / Deepseek（未定：路由策略）
+
+BACKLOG #1：计划增加 Open Code 调度，默认模型候选 `opencode/deepseek-v4.1-flash-free`，用于 L 级。
+**路由策略未定**——何时走 Open Code、何时仍走 Codex/CC，需调研后由产品拍板再改 `affinity.py` / `caps.json`。
+当前生产仍仅 `codex` / `cc` 两池；在路由方案确认前不改调度行为。
+
 亲和分（与 skill local-coding-dispatch 一致）→ 主池有空位就放；否则副池分 ≥45 才 spill；否则留 queue。
 
 ## 目录

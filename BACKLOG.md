@@ -3,10 +3,11 @@
 真相源：本文件（Pro `~/code/coding-scheduler/BACKLOG.md`）。改代码前看 `DESIGN.md`、`cs-fix-board.md`。
 
 ## 待办
-1. worktree 能力：submit 时可选 `--worktree`，cs 自动给每单开独立 git worktree（分支名=job id），跑完保留供合并；文件锁只用于明确改同一段核心代码的几单。
-2. 文件锁收窄：拒绝/告警整目录锁（如 `tests/`），要求写到具体文件。
-3. 失败自动续跑（之前 wave1 未做）。
-4. 生产状态根目录约 142 个续跑 / bak / tgz 文件需清理（本次不删除）。
+1. Open Code 池 + Deepseek v4.1 免费模型跑 L 级：接入 Open Code 调度；用 `opencode/deepseek-v4.1-flash-free`（或调研确认的模型 id）处理 L 级任务；含路由研究与负载均衡/caps 配置。**未定：路由策略**（何时走 Open Code vs Codex/CC）。
+2. worktree 能力：submit 时可选 `--worktree`，cs 自动给每单开独立 git worktree（分支名=job id），跑完保留供合并；文件锁只用于明确改同一段核心代码的几单。
+3. 文件锁收窄：拒绝/告警整目录锁（如 `tests/`），要求写到具体文件。
+4. 失败自动续跑（之前 wave1 未做）。
+5. 生产状态根目录约 142 个续跑 / bak / tgz 文件需清理（本次不删除）。
 
 ## 已完成
 - wave1：status 回收僵尸、exit0 但无结论→unknown（已修正早期 blocked 规则）、doctor 预检、cancel --superseded-by。

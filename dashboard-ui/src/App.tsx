@@ -1,33 +1,16 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence, motion } from "framer-motion";
 import {
-  AnimatePresence,
-  animate,
-  motion,
-  useReducedMotion,
-} from "framer-motion";
-import {
-  Activity,
-  ArrowDownRight,
-  ArrowUpRight,
-  Check,
-  CheckCheck,
-  ChevronRight,
-  CircleDot,
-  Clock3,
-  Code2,
-  Command,
-  Layers3,
-  ListFilter,
+  ChartGantt,
+  LayoutGrid,
   Moon,
+  Rows3,
+  Rows4,
   Search,
   Sun,
-  Terminal,
-  Timer,
   TriangleAlert,
+  X,
 } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -36,924 +19,543 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import type { Job, Pool, Reason, State } from "./types";
+import {
+  ATTENTION,
+  buildSnapshot,
+  clock,
+  dur,
+  haystack,
+  heatmap,
+  ms,
+  num,
+  projectName,
+  signature,
+  type HeatCell,
+} from "@/lib/derive";
+import { MetricsBar } from "@/components/dashboard/MetricsBar";
+import { JobTable } from "@/components/dashboard/JobTable";
+import { JobInspector } from "@/components/dashboard/JobInspector";
+import { ActivityHeatmap } from "@/components/dashboard/ActivityHeatmap";
+import { TimelineTab } from "@/components/dashboard/TimelineTab";
+import type { Row, State } from "./types";
 
-const results: Record<string, string> = {
-  done: "成功",
-  failed: "失败",
-  blocked: "受阻",
-  cancelled: "已取消",
-  unknown: "结果未知",
-};
-const areas: Record<string, string> = {
-  backend: "后端",
-  frontend: "前端",
-  protocol: "协议",
-  test: "测试",
-  research: "调研",
-  review: "审查",
-  "ui-copy": "界面文案",
-  "ops-script": "运维脚本",
-};
-const poolName = (pool?: string) =>
-  pool === "codex" ? "Codex" : pool === "cc" ? "CC" : "待分配";
-const time = (v?: string) => (v ? new Date(v).getTime() : NaN);
-const date = (v?: string) =>
-  v
-    ? new Date(v).toLocaleString("zh-CN", {
-        month: "2-digit",
-        day: "2-digit",
-        hour: "2-digit",
-        minute: "2-digit",
-        hour12: false,
-      })
-    : "—";
-function duration(seconds?: number | null) {
-  if (seconds == null || !Number.isFinite(seconds)) return "—";
-  const s = Math.max(0, Math.floor(seconds));
-  return s >= 3600
-    ? `${Math.floor(s / 3600)}小时 ${Math.floor((s % 3600) / 60)}分`
-    : s >= 60
-      ? `${Math.floor(s / 60)}分 ${s % 60}秒`
-      : `${s}秒`;
-}
-function NumberFlow({ value }: { value: number }) {
-  const reduce = useReducedMotion(),
-    previous = useRef(value);
-  const [display, setDisplay] = useState(value);
-  useEffect(() => {
-    const controls = animate(previous.current, value, {
-      duration: reduce ? 0 : 0.45,
-      onUpdate: setDisplay,
-    });
-    previous.current = value;
-    return () => controls.stop();
-  }, [value, reduce]);
-  return <span className="tabular-nums">{Math.round(display)}</span>;
-}
-function Hint({ children, text }: { children: ReactNode; text: ReactNode }) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>{children}</TooltipTrigger>
-      <TooltipContent className="max-w-96 break-words">{text}</TooltipContent>
-    </Tooltip>
-  );
-}
-function Project({ name }: { name?: string }) {
-  return (
-    <span className="project">
-      <span className="project-mark">
-        {(name || "?").slice(0, 2).toUpperCase()}
-      </span>
-      {name || "未分类"}
-    </span>
-  );
-}
-function FilterSelect({
-  value,
-  onChange,
-  label,
-  children,
-}: {
-  value: string;
-  onChange: (v: string) => void;
-  label: string;
-  children: ReactNode;
-}) {
-  return (
-    <Select value={value} onValueChange={onChange}>
-      <SelectTrigger aria-label={label} className="filter-select">
-        <SelectValue />
-      </SelectTrigger>
-      <SelectContent>{children}</SelectContent>
-    </Select>
-  );
-}
-function ReasonBadge({
-  reason,
-  blockers,
-}: {
-  reason: Reason;
-  blockers?: Reason[];
-}) {
-  const labels: Record<string, string> = {
-    lock: "文件锁冲突",
-    pool_full: `${poolName(reason.pool)} 池满`,
-    spill_insufficient: "副池分数不足",
-    quota_unknown: "额度未知",
-    quota_exhausted: "额度耗尽",
-    awaiting_tick: "等待调度",
-    launch_error: "启动失败",
+const POLL_MS = 4000;
+const HIDDEN_POLL_MS = 15000;
+const REQUEST_TIMEOUT_MS = 10000;
+const TICK_STALE_S = 180;
+const PAGE = 50;
+
+type View = "work" | "timeline";
+type Tab = "active" | "ended" | "attention" | "all";
+const TABS: [Tab, string][] = [
+  ["active", "进行中"],
+  ["ended", "已结束"],
+  ["attention", "历史需关注"],
+  ["all", "全部"],
+];
+
+function readParams() {
+  const p = new URLSearchParams(window.location.search);
+  const pick = <T extends string>(key: string, allowed: readonly T[], fallback: T): T => {
+    const v = p.get(key) as T | null;
+    return v && allowed.includes(v) ? v : fallback;
   };
-  const locks = reason.job ? [reason] : blockers || [];
-  const detail = (
-    <div className="space-y-1">
-      <p>{labels[reason.type] || reason.type}</p>
-      {locks.map((r, i) => (
-        <p key={i}>
-          阻挡单：{r.job || "—"}
-          <br />
-          申请文件：{r.mine || "—"}
-          <br />
-          占用文件：{r.theirs || r.mine || "—"}
-        </p>
-      ))}
-      {reason.detail && <p>{reason.detail}</p>}
-      {reason.type === "spill_insufficient" && (
-        <p>
-          亲和分 {reason.score} / 最低 {reason.minimum}
-        </p>
-      )}
-      {!locks.length && <p>无文件或任务阻挡记录</p>}
-    </div>
-  );
-  return (
-    <Hint text={detail}>
-      <button
-        className="reason-trigger"
-        aria-label={`${labels[reason.type] || reason.type}，查看原因`}
-      >
-        <Badge
-          variant="outline"
-          className={reason.type === "lock" ? "reason-lock" : "reason-other"}
-        >
-          {reason.type === "lock" && <Layers3 size={11} />}
-          {labels[reason.type] || reason.type}
-        </Badge>
-      </button>
-    </Hint>
-  );
+  return {
+    view: pick<View>("view", ["work", "timeline"], "work"),
+    tab: pick<Tab>("tab", ["active", "ended", "attention", "all"], "active"),
+    project: p.get("project") || "all",
+    pool: pick("pool", ["all", "codex", "cc"], "all"),
+    q: p.get("q") || "",
+    job: p.get("job"),
+  };
 }
-function PoolCard({
-  pool,
-  used,
-  cap,
-}: {
-  pool: Pool;
-  used: number;
-  cap: number;
-}) {
-  const reduce = useReducedMotion();
-  const percent = cap > 0 ? (used / cap) * 100 : 0;
-  return (
-    <Card className={cn("pool-card", pool)}>
-      <CardContent className="p-6">
-        <div className="flex items-start justify-between">
-          <div>
-            <div className="eyebrow">
-              <span className="pool-symbol">
-                {pool === "codex" ? <Code2 size={16} /> : <Command size={16} />}
-              </span>
-              {poolName(pool)} 执行池
-            </div>
-            <div className="pool-count">
-              <NumberFlow value={used} />
-              <span>
-                / {cap}
-                <small>槽位占用</small>
-              </span>
-            </div>
-          </div>
-          <svg
-            className="pool-ring"
-            viewBox="0 0 64 64"
-            aria-label={`占用 ${Math.round(percent)}%`}
-          >
-            <circle className="ring-track" cx="32" cy="32" r="26" />
-            <motion.circle
-              cx="32"
-              cy="32"
-              r="26"
-              className="ring-fill"
-              transition={{ duration: reduce ? 0 : 0.45 }}
-              initial={false}
-              animate={{ pathLength: Math.min(1, used / Math.max(1, cap)) }}
-              pathLength="1"
-              strokeDasharray="1 1"
-            />
-            <text x="32" y="36" textAnchor="middle">
-              {Math.round(percent)}%
-            </text>
-          </svg>
-        </div>
-        <div className="capacity-track">
-          <motion.div
-            transition={{ duration: reduce ? 0 : 0.45 }}
-            initial={false}
-            animate={{ width: `${Math.min(100, percent)}%` }}
-          />
-        </div>
-        <div className="pool-foot">
-          <span>{used >= cap ? "容量已满" : "可接收新任务"}</span>
-          <span>
-            剩余 <b>{Math.max(0, cap - used)}</b> 个槽位
-          </span>
-        </div>
-      </CardContent>
-    </Card>
-  );
+function stored(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
 }
-function RunningCard({ job, now }: { job: Job; now: number }) {
-  const reduce = useReducedMotion();
-  const seconds = Number.isFinite(time(job.started_at))
-    ? (now - time(job.started_at)) / 1000
-    : job.elapsed_seconds;
-  return (
-    <motion.article
-      layout={!reduce}
-      initial={{ opacity: 0, y: reduce ? 0 : 10 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: reduce ? 0 : -8 }}
-      transition={{ duration: reduce ? 0 : 0.2 }}
-      className="running-card"
-    >
-      <div className="flex justify-between gap-3">
-        <Project name={job.project} />
-        <Badge variant="outline" className={cn("pool-badge", job.pool)}>
-          <span className="live-dot" />
-          {poolName(job.pool)}
-        </Badge>
-      </div>
-      <h3 title={job.id}>{job.id}</h3>
-      <p className="job-model">{job.model || "模型未记录"}</p>
-      <div className="job-details">
-        <span>
-          {areas[job.area || ""] || job.area || "未分类"}
-          <i />
-          {job.tier || "—"} 档
-        </span>
-        <span className="job-timer">
-          <Timer size={13} />
-          {duration(seconds)}
-        </span>
-      </div>
-      <Hint text={job.log_last_line || "等待日志输出"}>
-        <div className="log-line" tabIndex={0}>
-          <Terminal size={13} />
-          <span>{job.log_last_line || "等待日志输出…"}</span>
-        </div>
-      </Hint>
-    </motion.article>
-  );
+function store(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    /* private mode */
+  }
 }
-function Timeline({ jobs, end }: { jobs: Job[]; end: number }) {
-  const start = end - 86400000;
-  const left = (v: number) =>
-    Math.max(0, Math.min(100, ((v - start) / 86400000) * 100));
-  const lanes = [
-    "codex",
-    "cc",
-    ...(jobs.some((j) => !j.pool && !j.pin) ? ["unassigned"] : []),
-  ];
-  return (
-    <Card className="timeline-card">
-      <CardContent className="p-6">
-        <div className="section-heading">
-          <div>
-            <h2>
-              <Activity size={16} />
-              生命周期
-            </h2>
-            <p>最近 24 小时 · 排队到完成，按执行池分泳道</p>
-          </div>
-          <div className="timeline-legend">
-            <span>
-              <i className="queue-color" />
-              排队
-            </span>
-            <span>
-              <i className="run-color" />
-              执行
-            </span>
-            <span>
-              <i className="fail-color" />
-              异常
-            </span>
-          </div>
-        </div>
-        <div className="timeline-scroll">
-          <div className="timeline-axis">
-            <span />
-            {Array.from({ length: 5 }, (_, i) => (
-              <span key={i}>
-                {new Date(start + i * 21600000).toLocaleTimeString("zh-CN", {
-                  hour: "2-digit",
-                  minute: "2-digit",
-                  hour12: false,
-                })}
-              </span>
-            ))}
-          </div>
-          {lanes.map((pool) => {
-            const laneJobs = jobs.filter(
-              (j) => (j.pool || j.pin || "unassigned") === pool,
-            );
-            return (
-              <div className="lane" key={pool}>
-                <div className="lane-title">
-                  <span className={cn("lane-dot", pool)} />
-                  {poolName(pool)}
-                  <small>{laneJobs.length} 单</small>
-                </div>
-                <div className="lane-body">
-                  {laneJobs.length === 0 ? (
-                    <p className="lane-empty">此时段暂无任务</p>
-                  ) : (
-                    laneJobs.map((job) => {
-                      const created =
-                          time(job.created_at) || time(job.started_at),
-                        started = time(job.started_at),
-                        finished = time(job.finished_at) || end;
-                      const queueEnd = Number.isFinite(started)
-                        ? started
-                        : finished;
-                      return (
-                        <div className="timeline-row" key={job.id}>
-                          <Hint
-                            text={
-                              <>
-                                <b>{job.id}</b>
-                                <br />
-                                项目：{job.project || "未分类"}
-                                <br />
-                                提交：{date(job.created_at)}
-                                <br />
-                                开始：{date(job.started_at)}
-                                <br />
-                                结束：{date(job.finished_at)}
-                                <br />
-                                结果：
-                                {results[job.status || ""] ||
-                                  (job.status === "running"
-                                    ? "运行中"
-                                    : "排队中")}
-                              </>
-                            }
-                          >
-                            <button
-                              className="timeline-job"
-                              aria-label={`${job.id} 生命周期`}
-                            >
-                              <span
-                                className="timeline-bar queue-color"
-                                style={{
-                                  left: `${left(created)}%`,
-                                  width: `${Math.max(0.3, left(queueEnd) - left(created))}%`,
-                                }}
-                              />
-                              {Number.isFinite(started) && (
-                                <span
-                                  className={cn(
-                                    "timeline-bar",
-                                    ["failed", "blocked", "unknown"].includes(
-                                      job.status || "",
-                                    )
-                                      ? "fail-color"
-                                      : "run-color",
-                                  )}
-                                  style={{
-                                    left: `${left(started)}%`,
-                                    width: `${Math.max(0.4, left(finished) - left(started))}%`,
-                                  }}
-                                />
-                              )}
-                              <span className="timeline-label">{job.id}</span>
-                            </button>
-                          </Hint>
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-function MiniCharts({ jobs }: { jobs: Job[] }) {
-  const success = jobs.filter((j) => j.status === "done").length;
-  const rate = jobs.length ? Math.round((success / jobs.length) * 100) : 0;
-  const durations = jobs
-    .filter((j) => j.elapsed_seconds != null)
-    .slice(0, 24)
-    .reverse();
-  const max = Math.max(1, ...durations.map((j) => j.elapsed_seconds || 0));
-  const average = durations.length
-    ? durations.reduce((sum, j) => sum + (j.elapsed_seconds || 0), 0) /
-      durations.length
-    : null;
-  return (
-    <div className="mini-charts">
-      <div className="success-summary">
-        <svg
-          viewBox="0 0 50 50"
-          role="img"
-          aria-label={`成功率 ${jobs.length ? rate + "%" : "暂无数据"}`}
-        >
-          <circle className="ring-track" cx="25" cy="25" r="20" />
-          <circle
-            className="success-arc"
-            cx="25"
-            cy="25"
-            r="20"
-            pathLength="100"
-            strokeDasharray={`${rate} 100`}
-          />
-          <CheckCheck x="16" y="16" width="18" height="18" />
-        </svg>
-        <div>
-          <small>当前筛选成功率</small>
-          <strong>
-            {jobs.length ? `${rate}%` : "—"}
-            <span>
-              {success} / {jobs.length} 单
-            </span>
-          </strong>
-        </div>
-      </div>
-      <div className="duration-summary">
-        <div>
-          <small>
-            平均耗时 <b>{duration(average)}</b>
-          </small>
-          <span>最近 {durations.length} 单</span>
-        </div>
-        <svg
-          viewBox="0 0 280 34"
-          preserveAspectRatio="none"
-          role="img"
-          aria-label="当前筛选最近完成单耗时柱状图"
-        >
-          {durations.map((job, i) => (
-            <rect
-              key={job.id}
-              x={i * (280 / Math.max(1, durations.length))}
-              y={34 - ((job.elapsed_seconds || 0) / max) * 30}
-              width={Math.max(2, 280 / Math.max(1, durations.length) - 4)}
-              height={Math.max(2, ((job.elapsed_seconds || 0) / max) * 30)}
-              rx="2"
-              className={
-                job.status === "done" ? "chart-success" : "chart-failure"
-              }
-            >
-              <title>
-                {job.id}：{duration(job.elapsed_seconds)}
-              </title>
-            </rect>
-          ))}
-        </svg>
-      </div>
-    </div>
-  );
-}
+
 export default function App() {
-  const [state, setState] = useState<State | null>(null),
-    [error, setError] = useState("");
-  const [now, setNow] = useState(Date.now()),
-    [project, setProject] = useState("all"),
-    [result, setResult] = useState("all"),
-    [keyword, setKeyword] = useState("");
-  const [dark, setDark] = useState(() =>
-    document.documentElement.classList.contains("dark"),
+  const initial = useMemo(readParams, []);
+  const [state, setState] = useState<State | null>(null);
+  const [error, setError] = useState("");
+  const [failures, setFailures] = useState(0);
+  const [fetchedAt, setFetchedAt] = useState(0);
+  const [now, setNow] = useState(Date.now());
+  const [view, setView] = useState<View>(initial.view);
+  const [tab, setTab] = useState<Tab>(initial.tab);
+  const [project, setProject] = useState(initial.project);
+  const [pool, setPool] = useState<string>(initial.pool);
+  const [q, setQ] = useState(initial.q);
+  const [selectedId, setSelectedId] = useState<string | null>(initial.job);
+  const [closed, setClosed] = useState(false);
+  const [page, setPage] = useState(0);
+  const [heatPick, setHeatPick] = useState<HeatCell | null>(null);
+  const [flash, setFlash] = useState<{ ids: Set<string>; phase: number }>({ ids: new Set(), phase: 0 });
+  const [density, setDensity] = useState(() =>
+    stored("cs-density") === "compact" ? "compact" : "comfortable",
   );
+  const [dark, setDark] = useState(() => stored("cs-theme") !== "light");
+  const searchRef = useRef<HTMLInputElement>(null);
+  const sigRef = useRef<Map<string, string> | null>(null);
+
   useEffect(() => {
     document.documentElement.classList.toggle("dark", dark);
-    try {
-      localStorage.setItem("cs-theme", dark ? "dark" : "light");
-    } catch {
-      /* private mode */
-    }
+    store("cs-theme", dark ? "dark" : "light");
   }, [dark]);
+  useEffect(() => store("cs-density", density), [density]);
+
+  // Polling: next request only after the previous one settles (never overlaps).
   useEffect(() => {
-    let active = true,
-      timer: ReturnType<typeof setTimeout>;
-    const controller = new AbortController();
+    let active = true;
+    let inFlight = false;
+    let errors = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let controller: AbortController | null = null;
+    const schedule = () => {
+      clearTimeout(timer);
+      const base = document.hidden ? HIDDEN_POLL_MS : POLL_MS;
+      const delay = errors ? Math.min(30000, POLL_MS * 2 ** (errors - 1)) : base;
+      timer = setTimeout(refresh, delay);
+    };
     async function refresh() {
+      if (inFlight || !active) return;
+      inFlight = true;
+      controller = new AbortController();
+      const timeout = setTimeout(() => controller?.abort(), REQUEST_TIMEOUT_MS);
       try {
-        const response = await fetch("./api/state", {
-          signal: controller.signal,
-          cache: "no-store",
-        });
-        if (!response.ok) throw new Error("状态接口暂不可用");
+        const response = await fetch("./api/state", { signal: controller.signal, cache: "no-store" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const next = (await response.json()) as State;
+        if (!next || typeof next !== "object") throw new Error("bad payload");
         if (active) {
+          errors = 0;
           setState(next);
+          setFetchedAt(Date.now());
+          setFailures(0);
           setError("");
         }
-      } catch {
-        if (active) setError("连接中断，显示上次快照，正在重试");
+      } catch (e) {
+        if (active) {
+          errors += 1;
+          setFailures(errors);
+          setError(e instanceof Error && e.name === "AbortError" ? "请求超时" : "状态接口不可用");
+        }
       } finally {
-        if (active) timer = setTimeout(refresh, 4000);
+        clearTimeout(timeout);
+        inFlight = false;
+        if (active) schedule();
       }
     }
+    const onVisible = () => {
+      if (!document.hidden && !inFlight) {
+        clearTimeout(timer);
+        void refresh();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
     void refresh();
-    const clock = setInterval(() => setNow(Date.now()), 1000);
+    const clockTimer = setInterval(() => setNow(Date.now()), 1000);
     return () => {
       active = false;
-      controller.abort();
+      controller?.abort();
       clearTimeout(timer);
-      clearInterval(clock);
+      clearInterval(clockTimer);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, []);
-  const dash = state?.dashboard;
-  const allJobs = [
-    ...(dash?.running || []),
-    ...(dash?.queued || []),
-    ...(dash?.completed || []),
-  ];
-  const projects = [
-    ...new Set(allJobs.map((j) => j.project || "未分类")),
-  ].sort();
-  const matches = (job: Job) =>
-    project === "all" || (job.project || "未分类") === project;
-  const running = (dash?.running || []).filter(matches),
-    queued = (dash?.queued || []).filter(matches);
-  const completed = (dash?.completed || [])
-    .filter(matches)
-    .filter(
-      (j) =>
-        (result === "all" || j.status === result) &&
-        `${j.id} ${j.project || ""} ${j.model || ""} ${j.cwd || ""}`
-          .toLowerCase()
-          .includes(keyword.trim().toLowerCase()),
-    );
-  const today = (dash?.done || []).filter(matches),
-    success = today.filter((j) => j.status === "done").length;
-  const tick = dash?.tick;
-  const tickAge = tick?.last_at
-    ? Math.max(0, (now - time(tick.last_at)) / 1000)
-    : null;
-  const tickHealthy = tick?.healthy && tickAge !== null && tickAge <= 180;
-  const tickLabel =
-    tick?.launchd.loaded === false
-      ? "调度未加载"
-      : tick?.launchd.loaded == null
-        ? "调度状态未知"
-        : tickAge == null
-          ? "等待首次心跳"
-          : tickAge > 180
-            ? "心跳已超时"
-            : tick.error
-              ? "上次调度异常"
-              : "调度正常";
+
+  const snap = useMemo(() => buildSnapshot(state), [state]);
+
+  // Flash rows whose visible state changed since the previous successful poll.
+  useEffect(() => {
+    if (!state) return;
+    const next = new Map<string, string>();
+    for (const r of snap.byId.values()) next.set(r.job.id, signature(r));
+    const prev = sigRef.current;
+    sigRef.current = next;
+    if (!prev) return;
+    const changed = new Set<string>();
+    for (const [id, sig] of next) if (prev.get(id) !== sig) changed.add(id);
+    if (changed.size) setFlash((f) => ({ ids: changed, phase: f.phase + 1 }));
+  }, [snap, state]);
+
+  // Persist view/filter/selection in the URL (replaceState: no history spam).
+  useEffect(() => {
+    const p = new URLSearchParams();
+    if (view !== "work") p.set("view", view);
+    if (tab !== "active") p.set("tab", tab);
+    if (project !== "all") p.set("project", project);
+    if (pool !== "all") p.set("pool", pool);
+    if (q) p.set("q", q);
+    if (selectedId) p.set("job", selectedId);
+    const search = p.toString();
+    window.history.replaceState(null, "", search ? `?${search}` : window.location.pathname);
+  }, [view, tab, project, pool, q, selectedId]);
+
+  useEffect(() => setPage(0), [tab, project, pool, q, heatPick]);
+
+  // Keyboard: "/" focuses search, Esc leaves the input.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const typing = e.target instanceof HTMLElement && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName);
+      if (e.key === "/" && !typing) {
+        e.preventDefault();
+        searchRef.current?.focus();
+      } else if (e.key === "Escape" && typing) {
+        (e.target as HTMLElement).blur();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  const drift = fetchedAt ? Math.max(0, (now - fetchedAt) / 1000) : 0;
+  const snapEnd = Number.isFinite(snap.updatedAt) ? snap.updatedAt : now;
+  // Estimated "now" on the snapshot clock: snapshot time + time since that sync.
+  const liveNow = Number.isFinite(snap.updatedAt) ? snap.updatedAt + drift * 1000 : now;
+
+  const byStart = (a: Row, b: Row) => (ms(a.job.started_at) || 0) - (ms(b.job.started_at) || 0);
+  const byCreate = (a: Row, b: Row) => (ms(a.job.created_at) || 0) - (ms(b.job.created_at) || 0);
+  const active = useMemo(
+    () => [...[...snap.running].sort(byStart), ...[...snap.queued].sort(byCreate)],
+    [snap],
+  );
+  const ended = snap.completed.filter((r) => snap.byId.get(r.job.id) === r);
+  const attention = ended.filter((r) => ATTENTION.includes(r.kind));
+  const tabRows: Record<Tab, Row[]> = { active, ended, attention, all: [...active, ...ended] };
+
+  const needle = q.trim().toLowerCase();
+  const filtered = tabRows[tab].filter((r) => {
+    if (project !== "all" && projectName(r.job.project) !== project) return false;
+    if (pool !== "all" && (r.job.pool || r.job.pin) !== pool) return false;
+    if (needle && !haystack(r).includes(needle)) return false;
+    if (heatPick && tab !== "active") {
+      const f = ms(r.job.finished_at);
+      if (projectName(r.job.project) !== heatPick.project || !(f >= heatPick.from && f < heatPick.to))
+        return false;
+    }
+    return true;
+  });
+  const pages = Math.max(1, Math.ceil(filtered.length / PAGE));
+  const current = Math.min(page, pages - 1);
+  const visible = filtered.slice(current * PAGE, (current + 1) * PAGE);
+  const heat = useMemo(() => heatmap(snap.completed, snapEnd), [snap, snapEnd]);
+
+  // Default selection: first active row, once, unless the user closed it.
+  useEffect(() => {
+    if (state && !selectedId && !closed) {
+      const first = active[0] || ended[0];
+      if (first) setSelectedId(first.job.id);
+    }
+  }, [state, selectedId, closed, active, ended]);
+
+  const selectedRow = selectedId ? snap.byId.get(selectedId) || null : null;
+  const select = (id: string) => {
+    setClosed(false);
+    setSelectedId(id);
+  };
+  const jump = (id: string) => {
+    select(id);
+    const row = snap.byId.get(id);
+    if (row && !tabRows[tab].includes(row)) setTab(row.bucket === "completed" ? "all" : "active");
+  };
+  const filtersOn = project !== "all" || pool !== "all" || !!needle || !!heatPick;
+  const clearFilters = () => {
+    setProject("all");
+    setPool("all");
+    setQ("");
+    setHeatPick(null);
+  };
+  const pickHeat = (cell: HeatCell | null) => {
+    setHeatPick(cell);
+    if (cell) {
+      setView("work");
+      if (tab === "active") setTab("ended");
+    }
+  };
+
+  // Scheduler health (tick) and API health are shown independently.
+  const tick = state?.dashboard?.tick || null;
+  const loaded = tick?.launchd?.loaded;
+  const baseAge = num(tick?.age_seconds);
+  const lastTick = ms(tick?.last_at);
+  const tickAge =
+    baseAge != null ? baseAge + drift : Number.isFinite(lastTick) ? Math.max(0, (now - lastTick) / 1000) : null;
+  const tickHealthy = loaded === true && tick?.error === false && tickAge != null && tickAge <= TICK_STALE_S;
+  const [tickTone, tickLabel] = !state
+    ? ["mute", "等待快照"]
+    : loaded === false
+      ? ["bad", "调度未加载"]
+      : tickAge == null
+        ? ["mute", "等待首次 tick"]
+        : tickAge > TICK_STALE_S
+          ? ["bad", `tick 超时 · ${dur(tickAge)}`]
+          : tick?.error === true
+            ? ["bad", "上次 tick 异常"]
+            : loaded == null || tick?.error == null
+              ? ["warn", `tick 状态未知 · ${dur(tickAge)}`]
+              : ["ok", `tick 正常 · ${dur(tickAge)}`];
+  const stale = !!error && !!state;
+  const breathing = tickHealthy && !error;
+
+  const emptyNode = !state ? (
+    <div className="empty-note">{error ? `${error}，正在重试…` : "正在读取快照…"}</div>
+  ) : filtersOn && tabRows[tab].length ? (
+    <div className="empty-note">
+      没有匹配的任务。
+      <button type="button" className="link" onClick={clearFilters}>
+        清空筛选
+      </button>
+    </div>
+  ) : tab === "active" ? (
+    <div className="empty-note">当前没有运行或排队任务（队列为空不等于整体健康）。</div>
+  ) : (
+    <div className="empty-note">当前记录中没有此类任务。</div>
+  );
+
   return (
-    <div className="app-shell">
-      <header className="topbar">
-        <a className="brand" href="./" aria-label="cs 实时看板首页">
-          <span>
-            <Terminal size={19} />
-          </span>
-          <b>
-            cs<span className="brand-divider">/</span>
-            <em>调度看板</em>
-          </b>
-          <Badge variant="outline">只读</Badge>
-        </a>
-        <div className="header-actions">
-          <Hint
-            text={
-              <div>
-                launchd：
-                {tick?.launchd.loaded
-                  ? "已加载"
-                  : tick?.launchd.loaded === false
-                    ? "未加载"
-                    : "未知"}
-                <br />
-                上次 tick：{date(tick?.last_at || undefined)}
-                <br />
-                距今：{duration(tickAge)}
-                <br />
-                超过 3 分钟报红
-              </div>
-            }
-          >
-            <span
-              tabIndex={0}
-              className={cn(
-                "tick-status",
-                tickHealthy ? "healthy" : "unhealthy",
-              )}
-            >
-              <span
-                className={cn("heartbeat", tickHealthy && !error && "beating")}
-              />
+    <div className={cn("shell", density === "compact" && "compact")}>
+      <nav className="rail" aria-label="视图">
+        <span className="logo">cs</span>
+        <button
+          type="button"
+          className={cn(view === "work" && "active")}
+          aria-label="工作台"
+          aria-pressed={view === "work"}
+          onClick={() => setView("work")}
+        >
+          <LayoutGrid size={17} />
+        </button>
+        <button
+          type="button"
+          className={cn(view === "timeline" && "active")}
+          aria-label="时间轴"
+          aria-pressed={view === "timeline"}
+          onClick={() => setView("timeline")}
+        >
+          <ChartGantt size={17} />
+        </button>
+        <span className="rail-bottom">LOCAL / SNAPSHOT</span>
+      </nav>
+      <div className="main">
+        <header className="topbar">
+          <div className="crumb">
+            <strong>coding scheduler</strong>
+            <span className="slash">/</span>
+            <span>本机工作台</span>
+            <span className="badge">只读</span>
+          </div>
+          <div className="statusline">
+            <span className={cn("api", stale ? "bad" : state ? "muted" : "mute")}>
+              {stale ? "旧快照 · 接口断开" : state ? "接口正常" : "连接中…"}
+            </span>
+            <span className={cn("tick", tickTone)} title={`tick 时间源：${tick?.time_source || "未知"}；last_at 来自日志 mtime，不是任务活性证明`}>
+              <i className={cn("dot", breathing && "breathing")} />
               {tickLabel}
             </span>
-          </Hint>
-          <span className="header-line" />
-          <Button
-            variant="ghost"
-            size="icon"
-            aria-label={dark ? "切换为亮色" : "切换为暗色"}
-            onClick={() => setDark(!dark)}
-          >
-            {dark ? <Sun size={18} /> : <Moon size={18} />}
-          </Button>
-        </div>
-      </header>
-      <main>
-        <div className="page-heading">
-          <div>
-            <div className="eyebrow heading-eyebrow">工作流 / 实时概览</div>
-            <h1>
-              让每一单，有序推进<span className="heading-dot">.</span>
-            </h1>
-            <p>执行池、排队原因与交付结果，一屏掌握。</p>
-          </div>
-          <div className="overview-controls">
-            <span className="refresh-note">
-              <span className="live-dot" />每 4 秒同步
+            <span className="mono muted" title="快照时间">
+              {Number.isFinite(snap.updatedAt) ? clock(snap.updatedAt) : "—"}
             </span>
-            <FilterSelect
-              value={project}
-              onChange={setProject}
-              label="按项目筛选"
+            <button
+              type="button"
+              className="icon-btn"
+              aria-label={density === "compact" ? "切换为舒适密度" : "切换为紧凑密度"}
+              title={density === "compact" ? "舒适密度" : "紧凑密度"}
+              onClick={() => setDensity(density === "compact" ? "comfortable" : "compact")}
             >
-              <SelectItem value="all">全部项目</SelectItem>
-              {projects.map((p) => (
-                <SelectItem value={p} key={p}>
-                  {p}
-                </SelectItem>
-              ))}
-            </FilterSelect>
+              {density === "compact" ? <Rows3 size={15} /> : <Rows4 size={15} />}
+            </button>
+            <button
+              type="button"
+              className="icon-btn"
+              aria-label={dark ? "切换为亮色" : "切换为暗色"}
+              onClick={() => setDark(!dark)}
+            >
+              {dark ? <Sun size={15} /> : <Moon size={15} />}
+            </button>
           </div>
-        </div>
-        {error && (
-          <div role="alert" className="error-banner">
-            <TriangleAlert size={16} />
-            {error}
-          </div>
-        )}
-        {!state && !error && (
-          <div className="loading" role="status">
-            正在读取调度快照…
-          </div>
-        )}
-        <section
-          className="summary-grid"
-          aria-label="执行池总占用与项目交付概览"
-        >
-          <PoolCard
-            pool="codex"
-            used={state?.counts.codex || 0}
-            cap={state?.caps.codex || 16}
-          />
-          <PoolCard
-            pool="cc"
-            used={state?.counts.cc || 0}
-            cap={state?.caps.cc || 6}
-          />
-          <Card className="delivery-card">
-            <CardContent className="p-6">
-              <div className="eyebrow">
-                <CheckCheck size={16} />
-                24 小时交付
-              </div>
-              <div className="delivery-count">
-                <NumberFlow value={today.length} />
-                <span>单已结束</span>
-                <span className="delivery-arrow">
-                  <ArrowUpRight size={22} />
-                </span>
-              </div>
-              <div className="delivery-foot">
-                <span>
-                  <i />
-                  成功 <b>{success}</b>
-                </span>
-                <span>
-                  成功率{" "}
-                  <b>
-                    {today.length
-                      ? `${Math.round((success / today.length) * 100)}%`
-                      : "—"}
-                  </b>
-                </span>
-              </div>
-            </CardContent>
-          </Card>
-        </section>
-        <section className="work-section">
-          <div className="section-heading">
+        </header>
+        <main className="body">
+          <div className="heading">
             <div>
-              <h2>
-                <CircleDot size={17} />
-                运行中 <Badge variant="secondary">{running.length}</Badge>
-              </h2>
-              <p>实时工作现场</p>
+              <div className="kicker">COMMAND CENTER</div>
+              <h1>每一单的现场，一眼可见。</h1>
             </div>
-            <span className="section-note">池容量显示全部项目占用</span>
+            <div className="seg" role="group" aria-label="视图切换">
+              <button type="button" aria-pressed={view === "work"} onClick={() => setView("work")}>
+                工作台
+              </button>
+              <button type="button" aria-pressed={view === "timeline"} onClick={() => setView("timeline")}>
+                执行分析
+              </button>
+            </div>
           </div>
-          <div className="running-grid">
-            <AnimatePresence initial={false}>
-              {running.map((job) => (
-                <RunningCard key={job.id} job={job} now={now} />
-              ))}
-            </AnimatePresence>
-          </div>
-          {!running.length && (
-            <div className="empty-state">
-              <Code2 size={22} />
-              <span>当前项目暂无运行中的任务</span>
+          {stale && (
+            <div role="alert" className="banner bad">
+              <TriangleAlert size={14} />
+              连接中断（{error}，已连续 {failures} 次）· 显示 {clock(fetchedAt)} 的旧快照，计时为估算，正在退避重试
             </div>
           )}
-        </section>
-        <section className="work-section queue-section">
-          <div className="section-heading">
-            <div>
-              <h2>
-                <Layers3 size={17} />
-                排队中 <Badge variant="secondary">{queued.length}</Badge>
-              </h2>
-              <p>查看每一单的等待原因</p>
+          {state && tickTone === "bad" && (
+            <div role="status" className="banner warn">
+              <TriangleAlert size={14} />
+              调度健康异常：{tickLabel}（接口本身{stale ? "也已断开" : "正常"}）
             </div>
-            <span className="section-note">
-              悬停或聚焦标签查看阻挡详情 <ChevronRight size={13} />
-            </span>
-          </div>
-          <Card className="queue-card">
-            <CardContent className="p-0">
-              {queued.length ? (
-                queued.map((job, i) => (
-                  <div className="queue-row" key={job.id}>
-                    <span className="queue-number">
-                      {String(i + 1).padStart(2, "0")}
-                    </span>
-                    <div className="queue-identity">
-                      <strong>{job.id}</strong>
-                      <span>
-                        {job.project || "未分类"}
-                        <i />
-                        {areas[job.area || ""] || job.area || "未分类"}
-                        <i />
-                        {job.tier || "—"} 档
-                      </span>
-                    </div>
-                    <div className="queue-reasons">
-                      {(job.queue_reasons?.length
-                        ? job.queue_reasons
-                        : [{ type: "awaiting_tick" }]
-                      ).map((r, k) => (
-                        <ReasonBadge
-                          key={k}
-                          reason={r}
-                          blockers={job.blocked_by}
-                        />
+          )}
+          <MetricsBar state={state} snap={snap} poolFilter={pool} onPool={setPool} />
+          <div className="workgrid">
+            <div className="workcol">
+              <section className="panel explorer">
+                <div className="panel-head">
+                  {view === "work" ? (
+                    <div className="tabs" role="tablist">
+                      {TABS.map(([id, label]) => (
+                        <button
+                          key={id}
+                          type="button"
+                          role="tab"
+                          aria-selected={tab === id}
+                          className={cn(tab === id && "active")}
+                          onClick={() => setTab(id)}
+                        >
+                          {label} <small>{state ? tabRows[id].length : "—"}</small>
+                        </button>
                       ))}
                     </div>
-                    <span className="queue-time">
-                      <Clock3 size={13} />
-                      {date(job.created_at)}
-                    </span>
-                  </div>
-                ))
-              ) : (
-                <div className="empty-state">
-                  <Check size={22} />
-                  <span>队列已清空，任务畅通无阻</span>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        </section>
-        <Timeline
-          jobs={(dash?.timeline || []).filter(matches)}
-          end={time(dash?.updated_at) || now}
-        />
-        <section className="work-section completed-section">
-          <div className="section-heading">
-            <div>
-              <h2>
-                <CheckCheck size={17} />
-                完成记录 <Badge variant="secondary">{completed.length}</Badge>
-              </h2>
-              <p>所有已结束任务 · 结果与执行耗时</p>
-            </div>
-            <div className="table-filters">
-              <div className="search-wrap">
-                <Search size={14} />
-                <Input
-                  aria-label="搜索完成单"
-                  placeholder="搜索任务、模型或路径…"
-                  value={keyword}
-                  onChange={(e) => setKeyword(e.target.value)}
-                />
-              </div>
-              <ListFilter size={15} className="muted-icon" />
-              <FilterSelect
-                value={result}
-                onChange={setResult}
-                label="按结果筛选"
-              >
-                <SelectItem value="all">全部结果</SelectItem>
-                {Object.entries(results).map(([v, text]) => (
-                  <SelectItem value={v} key={v}>
-                    {text}
-                  </SelectItem>
-                ))}
-              </FilterSelect>
-            </div>
-          </div>
-          <Card className="completed-card">
-            <CardContent className="p-0">
-              <MiniCharts jobs={completed} />
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>任务 / 项目</TableHead>
-                    <TableHead>执行池 / 模型</TableHead>
-                    <TableHead>结果</TableHead>
-                    <TableHead>耗时</TableHead>
-                    <TableHead className="text-right">完成时间</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {completed.map((job) => (
-                    <TableRow key={job.id}>
-                      <TableCell>
-                        <div className="table-job">
-                          <b>{job.id}</b>
-                          <span>{job.project || "未分类"}</span>
-                        </div>
-                      </TableCell>
-                      <TableCell>
-                        <div className="table-model">
-                          <span>{poolName(job.pool)}</span>
-                          <small>{job.model || "未记录模型"}</small>
-                        </div>
-                      </TableCell>
-                      <TableCell>
-                        <Badge
-                          variant="outline"
-                          className={cn(
-                            "result-badge",
-                            job.status === "done"
-                              ? "success"
-                              : job.status === "failed"
-                                ? "failure"
-                                : "other",
-                          )}
-                        >
-                          <span />
-                          {results[job.status || ""] || "结果未知"}
-                        </Badge>
-                      </TableCell>
-                      <TableCell className="tabular-nums">
-                        {duration(job.elapsed_seconds)}
-                      </TableCell>
-                      <TableCell className="text-right muted-cell">
-                        {date(job.finished_at)}
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                  {!completed.length && (
-                    <TableRow>
-                      <TableCell colSpan={5}>
-                        <div className="empty-state">
-                          <Search size={22} />
-                          <span>没有匹配的完成记录</span>
-                        </div>
-                      </TableCell>
-                    </TableRow>
+                  ) : (
+                    <h2>执行分析 · 等待与执行时间轴</h2>
                   )}
-                </TableBody>
-              </Table>
-            </CardContent>
-          </Card>
-        </section>
-        <footer>
-          <span>
-            <Terminal size={13} />
-            cs · 编码调度器
-          </span>
-          <span>
-            {dash ? `快照更新于 ${date(dash.updated_at)}` : "等待快照"}
-            <i />
-            只读快照，不回收、不调度
-          </span>
-          <a href="#top" aria-label="回到顶部">
-            回到顶部 <ArrowDownRight size={12} />
-          </a>
-        </footer>
-      </main>
+                  <small className="mono">{view === "work" ? "JOB EXPLORER" : "TIMELINE"}</small>
+                </div>
+                {view === "work" ? (
+                  <>
+                    <div className="toolbar">
+                      <div className="search">
+                        <Search size={13} aria-hidden />
+                        <Input
+                          ref={searchRef}
+                          aria-label="搜索任务"
+                          placeholder="搜索任务、项目、模型、区域…（/）"
+                          value={q}
+                          onChange={(e) => setQ(e.target.value)}
+                        />
+                      </div>
+                      <Select value={project} onValueChange={setProject}>
+                        <SelectTrigger aria-label="按项目筛选" className="filter-select">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="all">全部项目</SelectItem>
+                          {snap.projects.map((p) => (
+                            <SelectItem key={p} value={p}>
+                              {p}
+                            </SelectItem>
+                          ))}
+                          {project !== "all" && !snap.projects.includes(project) && (
+                            <SelectItem value={project}>{project}</SelectItem>
+                          )}
+                        </SelectContent>
+                      </Select>
+                      {pool !== "all" && (
+                        <button type="button" className="chip" onClick={() => setPool("all")}>
+                          池 {pool} <X size={11} />
+                        </button>
+                      )}
+                      {heatPick && tab !== "active" && (
+                        <button type="button" className="chip" onClick={() => setHeatPick(null)}>
+                          {heatPick.project} {clock(heatPick.from)}–{clock(heatPick.to)} <X size={11} />
+                        </button>
+                      )}
+                      <small className="mono muted count">{filtered.length} 单</small>
+                    </div>
+                    <JobTable
+                      rows={visible}
+                      selectedId={selectedId}
+                      onSelect={select}
+                      now={liveNow}
+                      drift={drift}
+                      flash={flash.ids}
+                      flashPhase={flash.phase}
+                      empty={emptyNode}
+                    />
+                    <div className="table-foot">
+                      <span className="muted">
+                        容量为全局口径，不随筛选变化 · 快照 {clock(snap.updatedAt, true)}
+                      </span>
+                      <span className="pager">
+                        <button
+                          type="button"
+                          aria-label="上一页"
+                          disabled={current === 0}
+                          onClick={() => setPage(current - 1)}
+                        >
+                          ←
+                        </button>
+                        <span className="mono">
+                          {current + 1} / {pages}
+                        </span>
+                        <button
+                          type="button"
+                          aria-label="下一页"
+                          disabled={current >= pages - 1}
+                          onClick={() => setPage(current + 1)}
+                        >
+                          →
+                        </button>
+                      </span>
+                    </div>
+                  </>
+                ) : (
+                  <TimelineTab
+                    rows={snap.timeline.filter(
+                      (r) => project === "all" || projectName(r.job.project) === project,
+                    )}
+                    end={snapEnd}
+                    selectedId={selectedId}
+                    onSelect={select}
+                  />
+                )}
+              </section>
+              {view === "work" && <ActivityHeatmap heat={heat} picked={heatPick} onPick={pickHeat} />}
+            </div>
+            <AnimatePresence mode="wait" initial={false}>
+              <motion.div
+                key={selectedId || "none"}
+                className="inspector-wrap"
+                initial={{ opacity: 0, x: 8 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.16 }}
+              >
+                <JobInspector
+                  row={selectedRow}
+                  missingId={state && selectedId && !selectedRow ? selectedId : null}
+                  now={liveNow}
+                  drift={drift}
+                  exists={(id) => snap.byId.has(id)}
+                  onJump={jump}
+                  onClose={() => {
+                    setClosed(true);
+                    setSelectedId(null);
+                  }}
+                  counts={state?.counts}
+                />
+              </motion.div>
+            </AnimatePresence>
+          </div>
+        </main>
+      </div>
     </div>
   );
 }

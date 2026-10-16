@@ -171,6 +171,91 @@ class SchedulerTests(unittest.TestCase):
                           "--cwd", str(self.cwd), "--prompt-text", "x", "--tick")
         self.assertIn("额度耗尽", output)
 
+    def test_submit_tick_json_contains_only_submitted_job(self):
+        self.submit("other", "--prompt-text", "another task")
+        result = self.submit("mine", "--prompt-text", "my task", "--tick")
+        self.assertEqual(set(result), {"schema_version", "id", "existing", "job"})
+        self.assertNotIn("other", json.dumps(result))
+        self.assertEqual(result["job"]["status"], "running")
+        self.assertEqual(core.find_job(self.root, "other")["status"], "running")
+        (self.root / "quota.json").write_text('{"codex": 0, "cc": 0}')
+        queued = self.submit("blocked-mine", "--prompt-text", "queued task", "--tick")
+        self.assertNotIn("other", json.dumps(queued))
+        self.assertIn("quota_exhausted", [r["type"] for r in queued["job"]["queue_reasons"]])
+
+    def test_lock_queue_and_board_reasons_are_unique(self):
+        self.record("active", "running", status="running", pid=os.getpid(), pool="codex",
+                    files=["src/", "src/a.py", "src/a.py"])
+        queued = self.record(files=["src/a.py", "./src/a.py", "src/a.py"])
+        core.tick(self.root)
+        queued = core.find_job(self.root, queued["id"])
+        locks = [r for r in queued["queue_reasons"] if r["type"] == "lock"]
+        self.assertEqual(len(locks), 1)
+        self.assertEqual(len(queued["blocked_by"]), 1)
+        # Also deduplicate persisted legacy reason lists when rendering the board.
+        queued["queue_reasons"] *= 3
+        core.write_job(self.root, "queue", queued)
+        board = core.write_board(self.root).read_text()
+        self.assertEqual(board.count("active 占用 src/a.py (write锁)"), 1)
+
+    def test_tick_log_summary_rotation_and_configurable_retention(self):
+        self.record("queued", pin="codex")
+        (self.root / "quota.json").write_text('{"codex": 0}')
+        result = json.loads(self.cli("tick"))
+        self.assertEqual(result["queued_count"], 1)
+        self.assertNotIn("queue_reasons", result)
+        path = self.root / "logs/tick.log"
+        core.tick(self.root)
+        self.assertEqual(len(path.read_text().splitlines()), 2)
+        for line in path.read_text().splitlines():
+            summary = json.loads(line)
+            self.assertEqual(summary["queued_count"], 1)
+            self.assertNotIn("queued", summary)
+        with patch.dict(os.environ, {"CS_TICK_LOG_MAX_BYTES": "512", "CS_TICK_LOG_BACKUPS": "2"}):
+            for _ in range(10):
+                core.tick(self.root)
+            logs = list(path.parent.glob("tick.log*"))
+            self.assertEqual(len(logs), 3)
+            self.assertTrue(all(log.stat().st_size <= 512 for log in logs))
+        with patch.dict(os.environ, {"CS_TICK_LOG_MAX_BYTES": "256", "CS_TICK_LOG_BACKUPS": "0"}):
+            for _ in range(3):
+                core.tick(self.root)
+            self.assertEqual(list(path.parent.glob("tick.log*")), [path])
+            self.assertLessEqual(path.stat().st_size, 256)
+
+    def test_tick_log_redirected_stdout_stays_bounded_without_duplicate_lines(self):
+        path = self.root / "logs/tick.log"
+        path.parent.mkdir()
+        env = dict(os.environ, CS_TICK_LOG_MAX_BYTES="512", CS_TICK_LOG_BACKUPS="2")
+        # Same append descriptor across invocations, as with launchd stdout.
+        with path.open("a") as output:
+            for _ in range(10):
+                result = subprocess.run(["/usr/bin/python3", str(REPO / "bin/cs"), "tick"],
+                                        env=env, stdout=output, stderr=subprocess.PIPE, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        logs = list(path.parent.glob("tick.log*"))
+        self.assertEqual(len(logs), 3)
+        self.assertTrue(all(log.stat().st_size <= 512 for log in logs))
+        lines = [line for log in logs for line in log.read_text().splitlines()]
+        self.assertTrue(lines)
+        for line in lines:
+            self.assertEqual(json.loads(line)["queued_count"], 0)
+            self.assertNotIn("at", json.loads(line))  # stdout is the only log writer.
+
+    def test_directory_warning_once_per_normalized_path_and_never_on_tick(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            args = ["cs", "submit", "--project", "p", "--area", "research", "--tier", "M",
+                    "--cwd", str(self.cwd), "--id", "dir", "--prompt-text", "goal", "--json",
+                    "--files", ".,./," + str(self.cwd), "--lock-shared", str(self.cwd) + "/"]
+            with patch.object(sys, "argv", args), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(CLI["main"](), 0)
+            core.tick(self.root)
+            core.tick(self.root)
+            with patch.object(sys, "argv", args), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(CLI["main"](), 2)  # duplicate submission cannot warn again.
+        self.assertEqual(stderr.getvalue().count("WARNING: directory lock"), 1)
+
     def test_idempotency_all_folders_and_no_prompt_overwrite(self):
         first = self.submit("original", "--prompt-text", "original", "--idempotency-key", "key")
         for folder in ("queue", "running", "done"):
@@ -223,6 +308,31 @@ class SchedulerTests(unittest.TestCase):
             core.reclaim(self.root)
             self.assertEqual(core.find_job(self.root, jid)["status"], status)
 
+    def test_research_and_explicit_read_only_do_not_require_code_delivery(self):
+        text = "分析完成。未提交代码，未推送，未开 PR；只读研究未启动子 agent。"
+        for jid, area, flags in [("research", "research", []),
+                                 ("read-only", "review", ["--read-only"])]:
+            self.submit(jid, "--area", area, "--prompt-text", "analysis", "--tick", *flags)
+            conclusion = core.remote_dir(jid) / "conclusion.md"
+            conclusion.write_text(text)
+            result = json.loads(self.cli("wait", jid, "--timeout", "0"))["jobs"][0]
+            self.assertEqual(result["status"], "done")
+            self.assertEqual(result["conclusion"], [text])
+        for code, body, expected in [(7, text, "failed"), (124, text, "unknown"), (0, "", "blocked")]:
+            conclusion.write_text(body)
+            self.assertEqual(core.classify_outcome(code, conclusion, {"read_only": True})[0], expected)
+
+    def test_worker_conclusion_is_external_and_prompt_overrides_template_path(self):
+        self.submit("external", "--prompt-text", "Write conclusion.md in the repository.", "--tick")
+        jd = core.remote_dir("external")
+        self.assertEqual(core.find_job(self.root, "external")["conclusion"], str(jd / "conclusion.md"))
+        prompt = (jd / "prompt.md").read_text()
+        self.assertIn("overrides template paths", prompt)
+        self.assertIn(str(jd / "conclusion.md"), prompt)
+        self.assertIn("do not create, stage, or commit", prompt)
+        self.assertEqual(list(self.cwd.glob("conclusion*")), [])
+        self.assertEqual(json.loads(self.cli("wait", "external"))["jobs"][0]["status"], "done")
+
     def test_status_completed_summary_elapsed_artifacts_and_prs(self):
         conclusion = self.base / "conclusion.txt"
         conclusion.write_text("first\nsecond\nhttps://github.com/org/repo/pull/123\n" * 3)
@@ -262,6 +372,26 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual([j["status"] for j in result["jobs"]], ["queued", "running"])
         self.assertEqual(core.find_job(self.root, "active")["status"], "running")
         self.assertIn("error", json.loads(self.cli("wait", "missing", expected=1)))
+
+    def test_wait_tick_advances_queued_jobs_but_default_does_not(self):
+        self.submit("one", "--prompt-text", "task", "--files", "shared.py")
+        self.submit("two", "--prompt-text", "task", "--files", "shared.py")
+        result = json.loads(self.cli("wait", "one", "--timeout", "0", expected=124))
+        self.assertEqual(result["jobs"][0]["status"], "queued")
+        with patch("time.sleep"):
+            result = json.loads(self.cli("wait", "one", "two", "--tick", "--timeout", "5"))
+        self.assertFalse(result["timed_out"])
+        self.assertEqual([j["status"] for j in result["jobs"]], ["done", "done"])
+
+    def test_wait_tick_timeout_and_missing_job_do_not_launch_unrelated_work(self):
+        self.submit("queued", "--prompt-text", "task", "--pin", "codex")
+        (self.root / "quota.json").write_text('{"codex": 0}')
+        result = json.loads(self.cli("wait", "queued", "--tick", "--timeout", "0", expected=124))
+        self.assertEqual(result["jobs"][0]["queue_reasons"][0]["type"], "quota_exhausted")
+        (self.root / "quota.json").unlink()
+        with patch.object(core, "launch") as launch:
+            self.cli("wait", "missing", "--tick", expected=1)
+        launch.assert_not_called()
 
     def test_wait_blocks_and_reclaims_after_completion_signal_without_starting_workers(self):
         self.record("one", "running", status="running", pid=os.getpid())
@@ -357,6 +487,16 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual((core.remote_dir(jid) / "exit").read_text().strip(), "7")
             self.assertFalse((self.cwd / "BAD").exists())
             self.assertFalse((self.cwd / "BAD2").exists())
+            if pool == "codex":
+                executable.write_text('#!/bin/sh\nwhile [ "$#" -gt 0 ]; do\n'
+                                      '  if [ "$1" = "-o" ]; then shift; result_path=$1; fi\n'
+                                      '  shift\ndone\ncat >/dev/null\nprintf "Delivered\\n" > "$result_path"\n')
+            else:
+                executable.write_text('#!/bin/sh\nprintf "Delivered\\n"\n')
+            result = subprocess.run(["/bin/bash", str(script)], env=env, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((core.remote_dir(jid) / "conclusion.md").read_text(), "Delivered\n")
+            self.assertEqual(list(self.cwd.glob("conclusion*")), [])
 
     def test_tick_launch_failure_is_reported_not_started(self):
         self.record(prompt_file="missing")
@@ -391,6 +531,26 @@ class SchedulerTests(unittest.TestCase):
             result = json.loads(self.cli("doctor", "--json"))
             self.assertIn("WARN", [c["level"] for c in result["checks"]])
         self.assertIn("FAIL", [c["level"] for c in core.doctor_checks(str(self.cwd / "missing"))])
+
+    def test_doctor_trust_requires_exact_accepted_project_and_is_only_advisory(self):
+        trust = self.base / ".claude.json"
+        for config, expected in [
+                ({"projects": {str(self.cwd): {"hasTrustDialogAccepted": True}}}, "OK"),
+                ({"projects": {str(self.cwd): {"hasTrustDialogAccepted": False}}}, "WARN"),
+                ({"projects": {str(self.cwd) + "-other": {"hasTrustDialogAccepted": True}}}, "WARN"),
+                ({"projects": {str(self.cwd.parent): {"hasTrustDialogAccepted": True}}}, "WARN"),
+                ({"history": str(self.cwd)}, "WARN"), ([], "WARN")]:
+            trust.write_text(json.dumps(config))
+            with patch.object(Path, "home", return_value=self.base), \
+                    patch("socket.getaddrinfo", return_value=[]):
+                checks = core.doctor_checks(str(self.cwd))
+            hint = next(c for c in checks if c["name"] == "claude_trusted_dir_hint")
+            self.assertEqual(hint["level"], expected)
+        trust.write_text("invalid JSON")
+        with patch.object(Path, "home", return_value=self.base), \
+                patch("socket.getaddrinfo", return_value=[]):
+            checks = core.doctor_checks(str(self.cwd))
+        self.assertEqual(next(c for c in checks if c["name"] == "claude_trusted_dir_hint")["level"], "WARN")
 
     def test_invalid_identifiers_and_wait_limits_return_schema_errors(self):
         for args in [("status", "../bad"), ("wait", "one", "--timeout", "-1"),

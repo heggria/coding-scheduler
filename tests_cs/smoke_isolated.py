@@ -25,9 +25,10 @@ def fingerprint(root):
 
 
 def main():
-    source = Path.home() / ".coding-scheduler"
+    source = Path(os.environ.get("CS_HOME") or os.environ.get("CODING_SCHEDULER_HOME")
+                  or Path.home() / ".coding-scheduler").expanduser().resolve()
     before = fingerprint(source)
-    smoke_dir = Path(tempfile.mkdtemp(prefix="cs-AD-smoke-", dir="/tmp"))
+    smoke_dir = Path(tempfile.mkdtemp(prefix="cs-AD-smoke-", dir="/tmp")).resolve()
     root = smoke_dir / "state"
     if source.exists():
         # Dereference links into independent copies, never reuse a writable link.
@@ -70,7 +71,15 @@ def main():
     assert not waited["timed_out"] and waited["jobs"][0]["status"] == "done"
     assert waited["jobs"][0]["exit"] == 0
     assert waited["jobs"][0]["changed_files"] == []
+    conclusion = Path(waited["jobs"][0]["artifacts"]["conclusion"])
+    assert conclusion == root / "workers" / jid / "conclusion.md"
+    assert not (cwd / "conclusion.md").exists()
     assert cs("status", jid)["job"]["status"] == "done"
+    second = cs("submit", "--project", "cs", "--area", "review", "--read-only", "--tier", "L",
+                "--cwd", str(cwd), "--id", "wait-tick", "--prompt-text", "Only fake worker.",
+                "--no-template")
+    assert second["job"]["status"] == "queued"
+    assert cs("wait", "wait-tick", "--tick", "--timeout", "5")["jobs"][0]["status"] == "done"
     board = Path(cs("board")["path"])
     assert "原因" in board.read_text()
     assert (root / "workers" / jid / "log").read_text() == "test fake worker\n"

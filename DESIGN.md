@@ -10,7 +10,7 @@ cs submit --project mm --area backend --tier H \
   [--lock-shared src/core.py,src/credits.py] [--pin codex] [--tick]
 cs tick
 cs status [<id>] [--json]
-cs wait <id> [<id>...] [--timeout SEC] [--lines N]
+cs wait <id> [<id>...] [--tick] [--timeout SEC] [--lines N]
 cs cancel <id>
 cs board
 cs doctor
@@ -37,13 +37,15 @@ common-dir，`worktree_root` 为 `git rev-parse --show-toplevel`。相对路径�
 - 路径重叠保留前缀语义：相等，或一方是另一方按 `/` 分隔的祖先。worktree 根锁覆盖
   整个 worktree；不同仓库的同名路径不冲突。非 Git 路径按绝对路径前缀互斥。
 - 提交目录锁（已存在目录、以 `/` 结尾、或解析到 cwd / worktree 根）时向 stderr
-  打印 `WARNING`，仍接收任务并保留目录前缀锁。
+  打印 `WARNING`，同单同解析目录只在提交时警告一次，tick 不重复；仍保留目录前缀锁。
 
 submit 保存含原始输入与解析结果的 `lock_ctx`。旧任务只有 `cwd` / `files` 也可在
 tick 时惰性解析，缺少 `shared_files` 视为空；无需改写历史任务。锁输入变化后重新解析。
 `file_conflict` 返回结构化列表（无冲突为空），含 `job`、`mine`、`theirs`、`kind`
 （任一方共享则为 `shared`，否则 `write`）与 `repo`。排队任务的 `blocked_by`
 内容只在冲突变化时改变，解锁后清除；每次检查仍保存 last_checked。
+同占用 job + 当前规范文件 + kind 的多条重叠锁仅保留首条冲突；不同 job/kind 保留。
+board 渲染时再按原因短句去重，兼容历史记录。
 
 **mm / OD 提交方迁移**：同仓库不同 worktree 修改同一文件，现在默认可以并行。
 如核心文件在合并时仍需串行，请显式增加 `--lock-shared`；已有 `--files` 不会自动
@@ -56,7 +58,7 @@ tick 时惰性解析，缺少 `shared_files` 视为空；无需改写历史任�
 ## 目录
 
 `~/.coding-scheduler/{queue,running,done,board.md}`
-`~/.remote-jobs/<id>/{pid,log,exit,conclusion.txt}`
+`~/.remote-jobs/<id>/{pid,log,exit,conclusion.md}`（旧 conclusion.txt 只读兼容）
 
 ## Bot 用法
 
@@ -79,12 +81,16 @@ tick 时惰性解析，缺少 `shared_files` 视为空；无需改写历史任�
 
 所有命令支持 `--json`（含参数/运行错误），响应版本为 `schema_version: "1"`。
 根级 `.lock` 串行化 CLI 的提交/回收/调度/取消；JSON 用临时文件替换，避免半写。
-wait 每次仅在回收和读取时持锁；不发起调度。等待完成退出 0，不代表各单成功；
+wait 默认每次仅在回收和读取时持锁；可选 --tick 在每轮等待时持锁运行全局 tick，
+也可能启动未列入等待列表的排队单。终态或缺失 ID 不发起调度。
+等待完成退出 0，不代表各单成功；
 等待超时退出 124，附当前摘要，不取消任务也不强改 unknown。
 
 queue/running/done 目录保留，done 下可保存 done/failed/blocked/cancelled/unknown。
 没有有效 exit 且 PID 已消失，或 exit=124 表示 worker 超时，结果为 unknown；
 exit=0 无有效 conclusion 为 blocked。旧记录缺少新增字段按空/None 读取，不强制迁移。
+area=research 或显式 --read-only 豁免结论的未交付关键词扫描，exit=0 且有非空结论即 done；
+其他单保留原扫描。该豁免不改变非零退出、124/无退出证据、空结论的判定。
 真实 worker 脚本用 EXIT trap 写退出码并原子替换 exit，非零退出不再丢失结果文件。
 
 ### 排队解释与额度边界
@@ -93,7 +99,15 @@ exit=0 无有效 conclusion 为 blocked。旧记录缺少新增字段按空/None
 lock 原因直接携带 B 的 blocked_by 项（job/mine/theirs/kind/repo）；blocked_by 仅在
 冲突变化时改变内容，但每次仍保存 last_checked。running 在回收检查时也更新该时间。
 pick_pool 返回 `(pool, reasons)`，失败原因含 primary/secondary/scores，spill 最低分仍为 45。
-submit 未指定 --tick 保留不启动语义，追加 awaiting_tick；指定时返回自己的状态/原因与调度结果。
+submit 未指定 --tick 保留不启动语义，追加 awaiting_tick；指定时仍运行全局调度，
+但响应仅含自己的状态/原因与摘要，不携带其他单或 schedule。
+
+tick 默认 stdout 仅一行计数 JSON（reclaimed/started_count/counts/queued_count），
+--json 才返回完整明细。tick.log 每轮只追加同样的计数摘要及时间，不存整份 queue_reasons。
+CS_TICK_LOG_MAX_BYTES 默认 1048576（最小 256），CS_TICK_LOG_BACKUPS 默认 3（0 不留备份）。
+达到大小上限时滚动 .1 至 .N；旧大日志仅保留末尾上限字节，防止历史日志突破容量。
+轮转复制后原 inode 截断，兼容 launchd 已打开的追加 stdout；若 stdout 指向该日志，
+内部不重复写入摘要。launchd 应运行默认 tick；显式 --json 重定向不受单行摘要大小保证。
 
 代码基线没有 quota 数据源，因此使用可选状态根 quota.json 的池→剩余额度快照。
 无快照保持旧行为；有快照时选中池的 0 / null或缺失分别对应耗尽 / 未知，阻止启动。
@@ -111,6 +125,8 @@ conclusion 仅输出前 N 行，PR 链接扫描全文并去重，支持 https://
 模板从 `<状态根>/projects/<project>.md` 读取并在 submit 时快照到 prompt_file，
 后改模板不影响已排单；--no-template 可关闭。模型参数按 shell 参数引用传给 worker，
 未指定保持默认；禁止子 agent 的硬规则仍统一置于最终 prompt 开头。
+prompt 末尾统一追加结论输出规则，覆盖模板内旧路径；Codex -o / Claude stdout 都写入
+worker 外部目录 conclusion.md，不把结论作为代码仓库交付物。仓库根 conclusion*.md 忽略。
 
 ### 路径和检查
 
@@ -121,3 +137,5 @@ CS_TEST_FAKE_WORKER=1 仅在非默认的显式根启用，完全同步，不执�
 
 doctor 增加 level=OK/WARN/FAIL；非 Git、无关池 CLI、DNS、信任提示只警告。
 --pool 选中 CLI 缺失、无效 cwd 或 Git 元数据写入失败为硬失败。
+Claude 信任提示原先已为 WARN；修正原始 JSON 子串匹配为 projects 中 cwd 准确规范路径
+且 hasTrustDialogAccepted=true。缺失、未接受、格式错误均只 WARN；worktree 无条目不会 FAIL。

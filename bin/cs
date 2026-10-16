@@ -89,6 +89,7 @@ def cmd_submit(args):
         "created_at": datetime.now(TZ).isoformat(), "status": "queued",
         "pool": None, "affinity": {}, "pid": None, "conclusion": None, "exit": None,
         "idempotency_key": args.idempotency_key, "model": args.model,
+        "read_only": args.read_only,
     }
     if args.review_of:
         job["review_of"] = args.review_of
@@ -99,28 +100,29 @@ def cmd_submit(args):
     if not args.tick:
         job["queue_reasons"].append({"type": "awaiting_tick"})
     write_job(root, "queue", job)
-    result = tick(root) if args.tick else None
+    if args.tick:
+        tick(root)
     write_board(root)
-    return submitted(args, find_job(root, jid), schedule=result)
+    return submitted(args, find_job(root, jid))
 
 
-def submitted(args, job, existing=False, schedule=None):
+def submitted(args, job, existing=False):
     if args.json:
         result = {"id": job["id"], "existing": existing, "job": job_summary(job)}
-        if schedule is not None:
-            result["schedule"] = schedule
         emit(result)
     else:
         print(job["id"])
         if job.get("status") == "queued":
             print(reason_text(job.get("queue_reasons", [])))
-        if schedule is not None:
-            emit(schedule)
     return 0
 
 
 def cmd_tick(args):
-    emit(tick(ensure()))
+    result = tick(ensure())
+    # launchd commonly redirects stdout to tick.log. Keep its default bounded.
+    emit(result if args.json else {"reclaimed": result["reclaimed"],
+         "started_count": len(result["started"]), "counts": result["counts"],
+         "queued_count": len(result["queued"])})
     return 0
 
 
@@ -170,6 +172,9 @@ def cmd_wait(args):
             if missing:
                 emit({"error": "not found", "ids": missing})
                 return 1
+            if args.tick and any(job.get("status") in ("queued", "running") for job in jobs):
+                tick(root)
+                jobs = [find_job(root, jid) for jid in ids]
             finished = all(job.get("status") not in ("queued", "running") for job in jobs)
             timed_out = not finished and deadline is not None and time.monotonic() >= deadline
             if finished or timed_out:
@@ -257,6 +262,7 @@ def main():
     s.add_argument("--lock-shared", default="", help="comma-separated repo resource path prefixes")
     s.add_argument("--id", type=identifier, default=None)
     s.add_argument("--review-of", choices=["codex", "cc"], default=None)
+    s.add_argument("--read-only", action="store_true", help="conclusion does not require code delivery")
     s.add_argument("--tick", action="store_true")
     s.set_defaults(func=cmd_submit)
 
@@ -266,10 +272,11 @@ def main():
     st.add_argument("id", nargs="?", type=identifier)
     st.add_argument("--lines", type=line_count, default=20)
     st.set_defaults(func=cmd_status)
-    w = sp.add_parser("wait", help="wait for all jobs; does not launch queued jobs")
+    w = sp.add_parser("wait", help="wait for all jobs; optionally tick the scheduler each round")
     w.add_argument("ids", nargs="+", type=identifier)
     w.add_argument("--timeout", type=nonnegative, default=None)
     w.add_argument("--lines", type=line_count, default=20)
+    w.add_argument("--tick", action="store_true", help="advance the scheduler while waiting")
     w.set_defaults(func=cmd_wait)
     c = sp.add_parser("cancel", help="cancel queued or running job")
     c.add_argument("id", type=identifier)

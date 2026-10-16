@@ -97,11 +97,13 @@ def lock_context(job, resolver=None):
 def directory_locks(context):
     """Yield original lock paths whose broad prefix should warn at submit."""
     cwd = Path(context["cwd"])
+    seen = set()
     for lock in context["locks"]:
         raw = lock["path"]
         path = (cwd / Path(raw).expanduser()).resolve()
-        if (raw.endswith("/") or path.is_dir() or path == cwd
+        if path not in seen and (raw.endswith("/") or path.is_dir() or path == cwd
                 or str(path) == lock["worktree_root"]):
+            seen.add(path)
             yield raw
 
 
@@ -117,6 +119,7 @@ def file_conflict(job, running, resolver=None):
     resolver = resolver if resolver is not None else GitLockResolver()
     mine = lock_context(job, resolver)["locks"]
     conflicts = []
+    seen = set()
     if not mine:
         return conflicts
     for other in running:
@@ -129,10 +132,15 @@ def file_conflict(job, running, resolver=None):
                 if not shared and m["worktree_root"] != t["worktree_root"]:
                     continue
                 if path_overlap(m["relpath"], t["relpath"]):
+                    kind = "shared" if shared else "write"
+                    key = (other["id"], m["repo_id"], m["worktree_root"], m["relpath"], kind)
+                    if key in seen:
+                        continue
+                    seen.add(key)
                     conflicts.append({
                         "job": other["id"], "mine": m["path"],
                         "theirs": t["path"],
-                        "kind": "shared" if shared else "write",
+                        "kind": kind,
                         "repo": m["repo_id"],
                     })
     return conflicts

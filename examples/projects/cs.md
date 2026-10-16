@@ -9,6 +9,9 @@
 ## 结论格式
 
 写 conclusion：改动摘要、commit SHA、验证命令与结果、产物路径、遗留问题。
+结论写到 worker prompt 指定的外部产物路径（默认 ~/.remote-jobs/<id>/conclusion.md）；
+不要在仓库 worktree 创建、暂存或提交 conclusion*.md。research/只读单只交付分析结论，
+无需为了完成状态提交代码、开 PR、合并或部署。
 完成实现、测试、合并、部署分别说明，不能以其中一项代替另一项。
 
 ## PR 规则

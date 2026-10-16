@@ -7,6 +7,8 @@ import math
 import os
 import re
 import shlex
+import shutil
+import sys
 from contextlib import contextmanager
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -180,7 +182,7 @@ BLOCKED_MARKERS = (
 )
 
 
-def classify_outcome(exit_code, conclusion_path):
+def classify_outcome(exit_code, conclusion_path, job=None):
     """No completion evidence is unknown; exit 124 denotes timeout."""
     if exit_code is None or exit_code == 124:
         return "unknown", None
@@ -192,6 +194,9 @@ def classify_outcome(exit_code, conclusion_path):
         text = ""
     if not text.strip():
         return "blocked", ["missing_conclusion"]
+    # Research/read-only delivery is the conclusion itself, not a commit/PR.
+    if job and (job.get("area") == "research" or job.get("read_only")):
+        return "done", None
     hits = [m for m in BLOCKED_MARKERS if m.lower() in text.lower()]
     return ("blocked", hits[:5]) if hits else ("done", None)
 
@@ -215,9 +220,11 @@ def reclaim(root):
             job["exit"] = int(exit_p.read_text().strip())
         except (OSError, ValueError):
             job["exit"] = None
-        conc = remote_dir(job["id"]) / "conclusion.txt"
+        conc = remote_dir(job["id"]) / "conclusion.md"
+        if not conc.exists():
+            conc = conc.with_suffix(".txt")  # Already running legacy workers.
         job["conclusion"] = str(conc) if conc.exists() else None
-        status, hits = classify_outcome(job["exit"], job["conclusion"])
+        status, hits = classify_outcome(job["exit"], job["conclusion"], job)
         job["status"] = status
         if status == "unknown":
             job["outcome_reason"] = "worker_timeout" if job["exit"] == 124 else "missing_or_invalid_exit"
@@ -241,12 +248,18 @@ def launch(root, job, pool):
     jd.mkdir(parents=True, exist_ok=True)
     body = Path(job["prompt_file"]).read_text()
     prompt_on_disk = jd / "prompt.md"
-    prompt_on_disk.write_text(NO_SUB + body)
     cwd = job.get("cwd") or str(Path.home())
-    log, conclusion, exit_file = jd / "log", jd / "conclusion.txt", jd / "exit"
+    log, conclusion, exit_file = jd / "log", jd / "conclusion.md", jd / "exit"
+    prompt_on_disk.write_text(NO_SUB + body + "\n\n" +
+        "CONCLUSION OUTPUT RULE (overrides template paths): Write the final conclusion to " +
+        str(conclusion) + ". Keep all conclusion*.md files outside the repository worktree; " +
+        "do not create, stage, or commit a conclusion file inside the repository. " +
+        "Research/read-only tasks deliver findings; no code commit, PR, merge, or deployment " +
+        "is required unless the task explicitly requests it.\n")
     # A manually reused ID must not inherit old completion evidence.
     exit_file.unlink(missing_ok=True)
     conclusion.unlink(missing_ok=True)
+    (jd / "conclusion.txt").unlink(missing_ok=True)
     base_sha = git_output(cwd, "rev-parse", "HEAD")
     job.update(pool=pool, model=model, effort=effort, base_sha=base_sha,
                started_at=datetime.now(TZ).isoformat(), conclusion=str(conclusion), log=str(log))
@@ -352,7 +365,8 @@ def reason_text(reasons):
             text = "启动失败：" + reason["detail"]
         else:
             text = str(kind)
-        texts.append(text)
+        if text not in texts:
+            texts.append(text)
     return "；".join(texts) or "—"
 
 
@@ -388,9 +402,51 @@ def tick(root, resolver=None):
         c = counts(running)
 
     write_board(root)
-    return {"reclaimed": reclaimed, "started": started, "counts": c,
+    result = {"reclaimed": reclaimed, "started": started, "counts": c,
             "queued": [{"id": j["id"], "queue_reasons": j.get("queue_reasons", []),
                         "last_checked": j.get("last_checked")} for j in load_jobs(root, "queue")]}
+    log_tick(root, result)
+    return result
+
+
+def log_tick(root, result):
+    """One bounded line per tick; rotate redirected launchd stdout in place too."""
+    def limit(name, default, minimum):
+        try:
+            return max(minimum, int(os.environ.get(name, default)))
+        except ValueError:
+            return default
+
+    max_bytes = limit("CS_TICK_LOG_MAX_BYTES", 1024 * 1024, 256)
+    backups = limit("CS_TICK_LOG_BACKUPS", 3, 0)
+    path = root / "logs" / "tick.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps({"at": datetime.now(TZ).isoformat(), "reclaimed": result["reclaimed"],
+                       "started_count": len(result["started"]), "counts": result["counts"],
+                       "queued_count": len(result["queued"])}) + "\n"
+    if path.exists() and path.stat().st_size + len(line.encode()) > max_bytes:
+        # Remove backups above a reduced retention setting as well.
+        for old in path.parent.glob("tick.log.*"):
+            if old.suffix[1:].isdigit() and int(old.suffix[1:]) > backups:
+                old.unlink()
+        if backups:
+            for number in range(backups, 1, -1):
+                previous = path.with_name("tick.log.%s" % (number - 1))
+                if previous.exists():
+                    previous.replace(path.with_name("tick.log.%s" % number))
+            # Preserve the inode: launchd may already have stdout/stderr open.
+            with path.open("rb") as source, path.with_name("tick.log.1").open("wb") as target:
+                source.seek(max(0, path.stat().st_size - max_bytes))
+                shutil.copyfileobj(source, target)
+        with path.open("r+b") as handle:
+            handle.truncate(0)
+    try:
+        redirected = path.exists() and os.path.samestat(os.fstat(sys.stdout.fileno()), path.stat())
+    except (AttributeError, OSError, ValueError):
+        redirected = False
+    if not redirected:
+        with path.open("a") as handle:
+            handle.write(line)
 
 
 def write_board(root):
@@ -490,14 +546,19 @@ def doctor_checks(cwd=None, pool=None):
         trust = Path.home() / ".claude.json"
         if trust.exists():
             try:
-                raw = trust.read_text(errors="replace")
-                ok = str(cpath) in raw or str(cpath.resolve()) in raw
+                config = json.loads(trust.read_text(errors="replace"))
+                projects = config.get("projects", {}) if isinstance(config, dict) else {}
+                ok = isinstance(projects, dict) and any(
+                    isinstance(value, dict) and value.get("hasTrustDialogAccepted") is True
+                    and Path(path).expanduser().resolve() == cpath.resolve()
+                    for path, value in projects.items())
                 add(
                     "claude_trusted_dir_hint",
                     ok,
-                    "path listed in ~/.claude.json" if ok else "path not listed in ~/.claude.json (may prompt/fail)",
+                    "trust accepted for cwd in ~/.claude.json" if ok else
+                    "cwd trust not confirmed in ~/.claude.json; advisory only (worker uses --dangerously-skip-permissions)",
                 )
-            except OSError as e:
+            except (OSError, ValueError) as e:
                 add("claude_trusted_dir_hint", False, str(e))
         else:
             add("claude_trusted_dir_hint", False, "~/.claude.json missing")

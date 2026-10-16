@@ -21,4 +21,4 @@
 
 ## 后续边界
 - quota.json 为可选外部维护快照；真实额度 API、自动刷新/扣减/按额度 spill 尚未实现。
-- wait 只回收不启动；自动排队推进仍由 tick/现有 launchd 负责。
+- wait 默认只回收；可选 --tick 在等待期间推进全局队列，或由现有 launchd 负责。

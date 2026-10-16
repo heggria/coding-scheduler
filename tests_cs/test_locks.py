@@ -66,6 +66,14 @@ class LockTests(unittest.TestCase):
                                   job("b", self.main, ["src/a.py"]))
         self.assertEqual(conflicts[0]["kind"], "write")
 
+    def test_duplicate_overlapping_locks_deduplicate_per_job_file_and_kind(self):
+        mine = job("mine", self.main, ["src/a.py", "./src/a.py"], ["src/a.py"])
+        others = [job("one", self.main, ["src/", "src/a.py", "src/a.py"]),
+                  job("two", self.main, ["src/a.py"])]
+        conflicts = file_conflict(mine, others, self.resolver)
+        self.assertEqual([(c["job"], c["kind"]) for c in conflicts],
+                         [("one", "write"), ("one", "shared"), ("two", "write"), ("two", "shared")])
+
     def test_directory_overlap_and_component_boundary(self):
         for a, b, expected in (("src/", "src/a.py", True),
                                ("src/a.py", "src", True),
@@ -196,6 +204,13 @@ class GitIntegrationTests(unittest.TestCase):
         self.assertEqual(file_conflict(a, [b], resolve)[0]["kind"], "shared")
         self.assertEqual(lock_context(b, resolve)["locks"][0]["relpath"], "src/gateway_console/agent.py")
 
+    def test_doctor_worktree_unconfirmed_claude_trust_is_warn(self):
+        with patch.object(Path, "home", return_value=self.base), \
+                patch("socket.getaddrinfo", return_value=[]):
+            checks = {c["name"]: c for c in core.doctor_checks(str(self.wt))}
+        self.assertEqual(checks["git_writable"]["level"], "OK")
+        self.assertEqual(checks["claude_trusted_dir_hint"]["level"], "WARN")
+
     def test_external_absolute_path_nearest_parent_and_git_cache(self):
         run = Mock(wraps=subprocess.run)
         resolve = GitLockResolver(run=run)
@@ -221,7 +236,8 @@ class GitIntegrationTests(unittest.TestCase):
             self.assertEqual(conflicts[0]["repo"], None)
 
     def test_tick_isolated_state_no_launch_and_blocked_by_stays_stable(self):
-        with tempfile.TemporaryDirectory() as state, patch.dict(os.environ, {"CODING_SCHEDULER_HOME": state}):
+        with tempfile.TemporaryDirectory() as state, patch.dict(
+                os.environ, {"CS_HOME": state, "CODING_SCHEDULER_HOME": state}):
             root = core.ensure()
             active = job("active", self.main, ["src/agent.py"])
             active.update(pool="codex", pid=os.getpid(), status="running")
@@ -264,7 +280,7 @@ class GitIntegrationTests(unittest.TestCase):
     def submit(self, root, jid, files="", shared=""):
         prompt = root / "prompt.md"
         prompt.write_text("fixture; do not launch\n")
-        env = dict(os.environ, CODING_SCHEDULER_HOME=str(root / "state"))
+        env = dict(os.environ, CS_HOME=str(root / "state"), CODING_SCHEDULER_HOME=str(root / "state"))
         return subprocess.run([
             sys.executable, str(REPO / "bin/cs"), "submit", "--project", "fixture",
             "--area", "backend", "--tier", "M", "--cwd", str(self.wt),

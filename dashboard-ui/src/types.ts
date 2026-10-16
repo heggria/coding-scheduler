@@ -1,6 +1,6 @@
 // Contract for GET /api/state (lib/dashboard.py, schema_version "1").
 // Every job field is optional: old job records may predate any of them.
-export type Pool = "codex" | "cc";
+export type Pool = "codex" | "cc" | "opencode";
 export interface Reason {
   type: string;
   pool?: string;

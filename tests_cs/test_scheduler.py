@@ -94,31 +94,32 @@ class SchedulerTests(unittest.TestCase):
         with patch.dict(os.environ):
             os.environ.pop("CS_CODEX_CAP", None)
             os.environ.pop("CS_CC_CAP", None)
-            self.assertEqual(core.reload_caps(), {"codex": 24, "cc": 6})
+            os.environ.pop("CS_OPENCODE_CAP", None)
+            self.assertEqual(core.reload_caps(), {"codex": 24, "cc": 6, "opencode": 4})
             self.assertEqual((affinity.CODEX_CAP, affinity.CC_CAP), (24, 6))
             os.environ["CS_CODEX_CAP"] = "30"
             os.environ["CS_CC_CAP"] = "bad"
-            self.assertEqual(core.reload_caps(), {"codex": 30, "cc": 6})
+            self.assertEqual(core.reload_caps(), {"codex": 30, "cc": 6, "opencode": 4})
             (self.root / "caps.json").write_text('{"codex": 8, "cc": 3}')
-            self.assertEqual(core.reload_caps(), {"codex": 8, "cc": 3})
+            self.assertEqual(core.reload_caps(), {"codex": 8, "cc": 3, "opencode": 4})
             self.assertEqual((core.CODEX_CAP, core.CC_CAP), (8, 3))
             (self.root / "caps.json").write_text('{"codex": 0, "cc": true}')
-            self.assertEqual(core.reload_caps(), {"codex": 30, "cc": 6})
+            self.assertEqual(core.reload_caps(), {"codex": 30, "cc": 6, "opencode": 4})
             (self.root / "caps.json").write_text("not json")
-            self.assertEqual(core.reload_caps(), {"codex": 30, "cc": 6})
+            self.assertEqual(core.reload_caps(), {"codex": 30, "cc": 6, "opencode": 4})
             (self.root / "caps.json").unlink()
             os.environ.pop("CS_CODEX_CAP")
-            self.assertEqual(core.reload_caps(), {"codex": 24, "cc": 6})
+            self.assertEqual(core.reload_caps(), {"codex": 24, "cc": 6, "opencode": 4})
 
     def test_import_defaults_and_status_picks_up_caps_json(self):
         import affinity
-        self.assertEqual(affinity.DEFAULT_CAPS, {"codex": 24, "cc": 6})
+        self.assertEqual(affinity.DEFAULT_CAPS, {"codex": 24, "cc": 6, "opencode": 4})
         (self.root / "caps.json").write_text('{"codex": 5}')
         out = json.loads(self.cli("status", "--json", "--no-reclaim"))
-        self.assertEqual(out["caps"], {"codex": 5, "cc": 6})
+        self.assertEqual(out["caps"], {"codex": 5, "cc": 6, "opencode": 4})
         (self.root / "caps.json").write_text('{"codex": 7, "cc": 2}')
         out = json.loads(self.cli("status", "--json", "--no-reclaim"))
-        self.assertEqual(out["caps"], {"codex": 7, "cc": 2})
+        self.assertEqual(out["caps"], {"codex": 7, "cc": 2, "opencode": 4})
         core.write_board(self.root)
         self.assertIn("Codex `0/7` · CC `0/2`", (self.root / "board.md").read_text())
 
@@ -160,6 +161,168 @@ class SchedulerTests(unittest.TestCase):
         (self.root / "quota.json").write_text('{"codex": null, "cc": 0}')
         self.assertEqual([r["type"] for r in core.quota_reasons(self.root, ["codex", "cc"])],
                          ["quota_unknown", "quota_exhausted"])
+
+    def test_opencode_caps_env_file_reload_counts_and_visibility(self):
+        import affinity
+        with patch.dict(os.environ, {"CS_OPENCODE_CAP": "9"}):
+            self.assertEqual(core.reload_caps()["opencode"], 9)
+            self.assertEqual(affinity.OPENCODE_CAP, 9)
+            (self.root / "caps.json").write_text('{"opencode": 2}')
+            self.assertEqual(core.reload_caps()["opencode"], 2)
+            (self.root / "caps.json").write_text('{"opencode": null}')
+            self.assertEqual(core.reload_caps()["opencode"], 9)
+            os.environ["CS_OPENCODE_CAP"] = "0"
+            self.assertEqual(core.reload_caps()["opencode"], 4)
+        for raw in ('{"opencode": true}', '{"opencode": -1}', '{"opencode": "bad"}'):
+            (self.root / "caps.json").write_text(raw)
+            with patch.dict(os.environ, {"CS_OPENCODE_CAP": "invalid"}):
+                self.assertEqual(affinity.load_caps(self.root)["opencode"], 4)
+        (self.root / "caps.json").write_text('{"opencode": 3}')
+        self.record("active", folder="running", pool="opencode", pid=os.getpid())
+        self.assertEqual(core.counts(core.load_jobs(self.root, "running"))["opencode"], 1)
+        self.assertIn("OpenCode 1/3", self.cli("status", "--no-reclaim"))
+        core.write_board(self.root)
+        self.assertIn("OpenCode `1/3`", (self.root / "board.md").read_text())
+        import dashboard
+        self.assertEqual(dashboard.snapshot()["caps"]["opencode"], 3)
+
+    def test_opencode_routing_matrix_and_no_spill(self):
+        (self.root / "caps.json").write_text('{"codex": 2, "cc": 2, "opencode": 2}')
+        base = dict(id="probe", cwd=str(self.cwd), tier="L", area="backend",
+                    files=["src/a.py"], risk="low", shared_files=[])
+        open_full = [dict(id="open-%s" % i, pool="opencode", files=[]) for i in range(2)]
+        paid_full = [dict(id="%s-%s" % (p, i), pool=p, files=[])
+                     for p in ("codex", "cc") for i in range(2)]
+        cases = [({}, [], "opencode"), ({}, open_full, "codex"),
+                 ({"pin": "opencode", "tier": "H"}, [], "opencode"),
+                 ({"pin": "opencode"}, open_full, None),
+                 ({"pin": "codex"}, [], "codex"), ({"pin": "cc"}, [], "cc"),
+                 ({"pin": "codex"}, paid_full, None), ({"pin": "cc"}, paid_full, None),
+                 ({"tier": "M"}, [], "codex"), ({"tier": "H"}, paid_full, None),
+                 ({"risk": "high"}, [], "codex"),
+                 ({"shared_files": ["src/shared.py"]}, [], "codex"),
+                 ({"files": ["a", "b", "c", "d"]}, [], "codex"),
+                 ({"files": ["a", "b", "c"]}, [], "opencode"),
+                 ({"area": "research", "read_only": True, "risk": "high",
+                   "files": ["lib/core.py"], "shared_files": ["shared"]}, [], "opencode")]
+        for changes, running, expected in cases:
+            job = dict(base, **changes)
+            with self.subTest(changes=changes, pools=[j["pool"] for j in running]):
+                self.assertEqual(core.check_queue(self.root, job, running), expected)
+                if changes.get("pin") == "opencode" and running:
+                    self.assertEqual(job["queue_reasons"], [
+                        {"type": "pool_full", "pool": "opencode", "free": 0}])
+        # Pins use ordinary affinity scores only for diagnostics, never to pick paid pools.
+        import affinity
+        self.assertEqual(affinity.score(dict(base, pin="opencode"), {}, {}),
+                         affinity.score(base, {}, {}))
+        blocker = dict(id="locked", cwd=str(self.cwd), files=["src/a.py"], pool="cc")
+        job = dict(base)
+        self.assertEqual(core.check_queue(self.root, job, [blocker]), "opencode")
+        self.assertEqual([r["type"] for r in job["queue_reasons"]], ["lock"])
+
+    def test_opencode_high_risk_paths_normalized_relative_to_repo(self):
+        subprocess.run(["git", "init", str(self.cwd)], check=True, capture_output=True)
+        (self.cwd / "src").mkdir()
+        for path in ("lib/core.py", "./lib/affinity.py", "src/../bin/cs", "launchd/agent.plist",
+                     str(self.cwd / "lib/core.py"), "../lib/core.py"):
+            cwd = self.cwd / "src" if path == "../lib/core.py" else self.cwd
+            job = dict(id="probe", tier="L", area="backend", cwd=str(cwd), files=[path])
+            with self.subTest(path=path):
+                self.assertFalse(core.low_risk(job))
+                self.assertNotEqual(core.check_queue(self.root, job, []), "opencode")
+        self.assertTrue(core.low_risk(dict(cwd=str(self.cwd), files=["src/lib/core.py"])))
+
+    def test_opencode_quota_exempt_and_fake_worker_models_pins(self):
+        for raw in ('{}', '{"opencode": null}', '{"opencode": 0}', 'broken'):
+            (self.root / "quota.json").write_text(raw)
+            self.assertEqual(core.quota_reasons(self.root, ["opencode"]), [])
+            job = dict(id="probe", cwd=str(self.cwd), pin="opencode")
+            self.assertEqual(core.check_queue(self.root, job, []), "opencode")
+            self.assertEqual(job["queue_reasons"], [])
+        (self.root / "quota.json").unlink()
+        for tier in ("L", "M", "H"):
+            self.assertEqual(core.model_for("opencode", tier),
+                             ("opencode/deepseek-v4.1-flash-free", "max"))
+        for pool in ("opencode", "codex", "cc"):
+            self.submit(pool, "--pin", pool, "--tier", "L", "--prompt-text", "fixture", "--tick")
+            self.assertEqual(core.find_job(self.root, pool)["pool"], pool)
+            core.reclaim(self.root)
+            job = core.find_job(self.root, pool)
+            self.assertEqual(job["status"], "done")
+            if pool == "opencode":
+                self.assertEqual(job["effort"], "max")
+
+    def test_opencode_model_validation_at_submit_and_launch(self):
+        for flags in (("--pin", "opencode"), ("--tier", "L")):
+            result = self.submit("bad-model", "--prompt-text", "fixture", "--model", "other/model",
+                                 *flags, expected=2)
+            self.assertIn("opencode/", result["error"])
+            self.assertIsNone(core.find_job(self.root, "bad-model"))
+            self.assertFalse((self.root / "queue/bad-model.prompt.md").exists())
+        job = self.record(model="gpt-6.1-sol")
+        with patch.object(core, "remote_dir") as remote:
+            with self.assertRaisesRegex(ValueError, "opencode/"):
+                core.launch(self.root, job, "opencode")
+            remote.assert_not_called()
+        core.remove_job(self.root, "queue", job["id"])
+        self.submit("custom-open", "--pin", "opencode", "--prompt-text", "fixture",
+                    "--model", "opencode/custom", "--tick")
+        self.assertEqual(core.find_job(self.root, "custom-open")["model"], "opencode/custom")
+        self.assertEqual(core.find_job(self.root, "custom-open")["effort"], "max")
+
+    def test_opencode_shell_jsonl_flags_prompt_and_exit(self):
+        self.submit("open-shell", "--pin", "opencode", "--prompt-text", "goal with 'quotes'\nnext")
+        job = core.find_job(self.root, "open-shell")
+        model = "opencode/custom; $(touch BAD) `touch BAD2`"
+        job.update(model=model, effort="low")
+        with patch.dict(os.environ, {"CS_TEST_FAKE_WORKER": "0"}), \
+                patch.object(core, "git_output", return_value=None), \
+                patch.object(core.subprocess, "Popen", return_value=Mock(pid=123)) as popen:
+            core.launch(self.root, job, "opencode")
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(job["pgid"], 123)
+        self.assertEqual(job["effort"], "max")
+        worker = core.remote_dir(job["id"])
+        script = worker / "run.sh"
+        self.assertIn("opencode run -m", script.read_text())
+        self.assertIn("--variant max --auto --pure --format json --dir", script.read_text())
+        fake_bin = self.base / "fake-opencode"
+        fake_bin.mkdir()
+        executable = fake_bin / "opencode"
+        executable.write_text('#!/usr/bin/python3\nimport json, sys\nfrom pathlib import Path\n'
+                              'Path("args.json").write_text(json.dumps(sys.argv[1:]))\n'
+                              'print(json.dumps({"type":"step_start"}))\n'
+                              'print(json.dumps({"type":"tool_use","part":{"text":"ignore"}}))\n'
+                              'print(json.dumps({"type":"text","part":{"text":"STATUS: DONE\\n"}}))\n'
+                              'print(json.dumps({"type":"text","part":{"text":"完成\\n"}}))\n')
+        executable.chmod(0o755)
+        env = dict(os.environ, PATH=str(fake_bin) + ":/usr/bin:/bin")
+        result = subprocess.run(["/bin/bash", str(script)], env=env, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = json.loads((self.cwd / "args.json").read_text())
+        self.assertEqual(args[:-1], ["run", "-m", model, "--variant", "max", "--auto", "--pure",
+                                   "--format", "json", "--dir", str(self.cwd)])
+        self.assertEqual(args[-1], (worker / "prompt.md").read_text().rstrip("\n"))
+        self.assertEqual((worker / "conclusion.md").read_text(), "STATUS: DONE\n完成\n")
+        self.assertEqual((worker / "exit").read_text(), "0\n")
+        self.assertFalse((self.cwd / "BAD").exists())
+        self.assertFalse((self.cwd / "BAD2").exists())
+        self.assertEqual(list(self.cwd.glob("conclusion*")), [])
+        executable.write_text('#!/bin/sh\nexit 7\n')
+        result = subprocess.run(["/bin/bash", str(script)], env=env, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual((worker / "exit").read_text(), "7\n")
+        executable.write_text('#!/bin/sh\nprintf "invalid-json\\n"\n')
+        result = subprocess.run(["/bin/bash", str(script)], env=env, capture_output=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotEqual((worker / "exit").read_text(), "0\n")
+
+    def test_opencode_doctor_cli_is_required_only_for_selected_pool(self):
+        with patch("shutil.which", return_value=None), patch("socket.getaddrinfo", return_value=[]):
+            for pool in ("opencode", "codex", None):
+                checks = {c["name"]: c for c in core.doctor_checks(str(self.cwd), pool)}
+                self.assertEqual(checks["opencode_cli"]["level"], "FAIL" if pool == "opencode" else "WARN")
 
     def test_blocked_quota_then_start_clears_reasons_and_updates_check_time(self):
         self.record(pin="codex", prompt_file=str(self.root / "prompt"), blocked_by=[{"job": "old"}])
@@ -267,7 +430,8 @@ class SchedulerTests(unittest.TestCase):
             result = self.submit(jid, "--prompt-text", "x", "--pin", "codex", *flags)
             self.assertIn("quota_exhausted", [r["type"] for r in result["job"]["queue_reasons"]])
         output = self.cli("submit", "--project", "p", "--area", "backend", "--tier", "L",
-                          "--cwd", str(self.cwd), "--prompt-text", "x", "--files", "task.py", "--tick")
+                          "--cwd", str(self.cwd), "--prompt-text", "x", "--files", "task.py",
+                          "--pin", "codex", "--tick")
         self.assertIn("额度耗尽", output)
 
     def test_submit_tick_json_contains_only_submitted_job(self):

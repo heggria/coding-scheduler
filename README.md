@@ -36,7 +36,7 @@ cs board --json
 - `--files` 必须逐一列出输出/可写文件的准确路径（包括要写的评审文档），不要填目录。
   仅同时指定 `--area research --read-only` 时允许为空；review/backend 等即使
   指定 `--read-only` 也必须列出文件。非空目录锁仍只警告，不拒绝。
-- `--model` 透传给所选 codex/claude，省略沿用默认模型；`research` 和显式 `--read-only`
+- `--model` 透传给所选 codex/claude/opencode（OpenCode 要求 `opencode/` 前缀），省略沿用默认模型；`research` 和显式 `--read-only`
   的单可交付分析结论；这不豁免上述 `--files` 要求。结论提到“未提交/未推送/只读”等不再误判 blocked。
   所有任务统一使用下述退出证据与结构化状态规则，不扫描自然语言未交付短语。
 - submit 默认只排队，并立即返回全部已知阻塞原因和 `awaiting_tick`；`--tick` 才尝试启动。
@@ -60,7 +60,7 @@ cs board --json
   其余记 done，适用于编码、research 和 read-only 单；成功结论应写 `STATUS: DONE`。
   自然语言“未合并/只读/未提交”等不参与判定；其他非零退出（除 124）记 failed。
 - doctor 的非 Git、DNS、信任提示及与所选池无关的 CLI 检查失败为 WARN；
-  `--pool codex|cc` 指定的 CLI 缺失、cwd 无效、Git 元数据不可写仍为 FAIL。
+  `--pool codex|cc|opencode` 指定的 CLI 缺失、cwd 无效、Git 元数据不可写仍为 FAIL。
   `claude_trusted_dir_hint` 仅检查 `.claude.json` 中 cwd 的准确项目路径及
   `hasTrustDialogAccepted: true`；普通目录、worktree 未确认信任时为 WARN，
   不阻止启动，也不代表实际信任失败（worker 已使用 skip-permissions）。
@@ -76,9 +76,26 @@ launchd 将 stdout 追加重定向到同一 tick.log 时只记 stdout 一份，�
 
 ## 池上限（caps）
 
-Codex/CC 并发上限默认 24/6，运行时读取 `{CS_HOME}/caps.json`（`{"codex":24,"cc":6}`，正整数），
-其次环境变量 `CS_CODEX_CAP` / `CS_CC_CAP`，最后用默认值。tick、status、board、dashboard `/api/state`
+Codex/CC/OpenCode 并发上限默认 24/6/4，运行时读取 `{CS_HOME}/caps.json`（`{"codex":24,"cc":6,"opencode":4}`，正整数），
+其次环境变量 `CS_CODEX_CAP` / `CS_CC_CAP` / `CS_OPENCODE_CAP`，最后用默认值。tick、status、board、dashboard `/api/state`
 每次重读，改 caps.json 无需改代码。该文件是运行时状态，不提交。
+
+## OpenCode L 级路由
+
+未 pin 的 L 级低风险任务优先走 `opencode`，池满回退原 Codex/CC 亲和选池。
+低风险为 research + read-only，或 files ≤3、无 shared_files、risk≠high 且无高风险路径；
+仓库相对路径前缀 `lib/core.py`、`lib/affinity.py`、`bin/`、`launchd/` 为高风险。
+`--pin opencode` 只等待此池，`--pin codex|cc` 保持旧逻辑；OpenCode 不参与 spill。
+默认模型 `opencode/deepseek-v4.1-flash-free`，variant 固定 `max`；此池免费，豁免 quota.json 门禁。
+JSONL text parts 提取为外部 conclusion.md，原始事件留在 worker 的 output.jsonl / log。
+
+可选真实冒烟命令（不属于自动测试；显式执行才调用真实模型）：
+
+```bash
+CS_HOME="$(mktemp -d /tmp/cs-opencode-real-XXXXXX)" bin/cs submit --project cs \
+  --area research --read-only --tier L --pin opencode --cwd /tmp \
+  --prompt-text 'Reply with STATUS: DONE and a short hello.' --no-template --tick --json
+```
 
 ## 项目模板与额度快照
 
@@ -101,7 +118,7 @@ worker prompt 仍会添加禁止子 agent 的硬规则。
 ```
 
 正数表示已知有额度，0 表示 `quota_exhausted`，null/缺失/非法表示 `quota_unknown`。
-存在快照时阻止选中池在额度未知/耗尽时启动；无文件沿用旧行为，不启用额度门禁。
+OpenCode 池始终豁免。存在快照时阻止选中的 Codex/CC 池在额度未知/耗尽时启动；无文件沿用旧行为，不启用额度门禁。
 快照由外部维护，不自动扣减、刷新或按额度切换副池；池选择仍按容量与亲和度规则。
 
 ## 隔离测试
@@ -121,4 +138,4 @@ worker prompt 仍会添加禁止子 agent 的硬规则。
 归档副本中旧任务/额度配置，设置隔离 `CS_HOME` 和仅测试用 `CS_TEST_FAKE_WORKER=1`，
 执行 submit → tick → wait → status → board。它检查新任务状态和产物均写入临时 CS_HOME，
 并保留 JSON 证据；源目录可由生产 launchd 并发更新，不比较源目录指纹。
-假 worker 同步生成 log/conclusion/exit，拒绝默认生产状态根，不执行真实 codex/claude。
+假 worker 同步生成 log/conclusion/exit，拒绝默认生产状态根，不执行真实 codex/claude/opencode。

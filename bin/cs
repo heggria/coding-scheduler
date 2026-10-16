@@ -56,6 +56,7 @@ def line_count(value):
 
 
 def cmd_submit(args):
+    core.validate_model(args.pin, args.model)
     files = [f.strip() for f in args.files.split(",") if f.strip()]
     shared_files = [f.strip() for f in args.lock_shared.split(",") if f.strip()]
     if not files and not (args.area == "research" and args.read_only):
@@ -110,7 +111,12 @@ def cmd_submit(args):
     job["lock_ctx"] = lock_context(job)
     for path in directory_locks(job["lock_ctx"]):
         print("WARNING: directory lock %r covers all descendant paths" % path, file=sys.stderr)
-    check_queue(root, job, load_jobs(root, "running"))
+    pool = check_queue(root, job, load_jobs(root, "running"))
+    try:
+        core.validate_model(pool, args.model)
+    except ValueError:
+        prompt_dst.unlink()
+        raise
     if not args.tick:
         job["queue_reasons"].append({"type": "awaiting_tick"})
     write_job(root, "queue", job)
@@ -167,7 +173,8 @@ def cmd_status(args):
         emit({"counts": c, "caps": caps,
               "reclaimed": reclaimed, "running": running, "queued": queued})
     else:
-        print("Codex %s/%s  CC %s/%s" % (c["codex"], caps["codex"], c["cc"], caps["cc"]))
+        print("Codex %s/%s  CC %s/%s  OpenCode %s/%s" %
+              (c["codex"], caps["codex"], c["cc"], caps["cc"], c["opencode"], caps["opencode"]))
         print("running=%s queued=%s reclaimed=%s" % (len(running), len(queued), reclaimed))
         for job in running + queued:
             print("  [%s] %s tier=%s pool=%s area=%s %s" %
@@ -278,7 +285,7 @@ def main():
     s.add_argument("--no-template", action="store_true")
     s.add_argument("--model", default=None)
     s.add_argument("--idempotency-key", default=None)
-    s.add_argument("--pin", choices=["codex", "cc"], default=None)
+    s.add_argument("--pin", choices=["codex", "cc", "opencode"], default=None)
     s.add_argument("--risk", choices=["low", "high"], default="low")
     s.add_argument("--files", default="", help="comma-separated exact output/writable file paths, including review docs; empty only with --area research --read-only (directory paths warn)")
     s.add_argument("--lock-shared", default="", help="comma-separated exact resource paths")
@@ -310,7 +317,7 @@ def main():
     b.set_defaults(func=cmd_board)
     d = sp.add_parser("doctor", help="check paths and CLIs / env preflight")
     d.add_argument("--cwd", default=None)
-    d.add_argument("--pool", choices=["codex", "cc"], default=None, help="required worker CLI; other CLI checks only warn")
+    d.add_argument("--pool", choices=["codex", "cc", "opencode"], default=None, help="required worker CLI; other CLI checks only warn")
     d.set_defaults(func=cmd_doctor)
     dashboard = sp.add_parser("dashboard", help="serve the read-only live dashboard")
     dashboard.add_argument("--host", default="127.0.0.1")

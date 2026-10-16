@@ -186,7 +186,7 @@ h2 { font-size: 13px; font-weight: 600; }
 
 /* ---------- metric strip ---------- */
 .metric-strip {
-  display: grid; grid-template-columns: 1.04fr 1.04fr 1fr 1fr;
+  display: grid; grid-template-columns: 1.04fr 1.04fr 1.04fr 1fr 1fr;
   border: 1px solid var(--border); border-radius: 8px; margin-bottom: 16px;
   background: linear-gradient(100deg, color-mix(in srgb, var(--accent) 7%, var(--surface)), var(--surface) 70%);
 }
@@ -203,6 +203,7 @@ h2 { font-size: 13px; font-weight: 600; }
 .slot { flex: 1; border-radius: 2px; background: var(--slot); overflow: hidden; }
 .slot i { display: block; height: 100%; background: var(--accent); opacity: 0; transition: opacity 220ms ease; }
 .cc .slot i { background: var(--cyan); }
+.opencode .slot i { background: var(--green); }
 .slot.used i { opacity: 1; }
 .slot.used { box-shadow: 0 0 8px var(--glow); }
 .slot.over i { background: var(--red); }

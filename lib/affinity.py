@@ -5,10 +5,11 @@ import json
 import os
 from pathlib import Path
 
-DEFAULT_CAPS = {"codex": 24, "cc": 6}
+DEFAULT_CAPS = {"codex": 24, "cc": 6, "opencode": 4}
 # Import-time defaults; reload_caps() refreshes them from caps.json / env.
 CODEX_CAP = DEFAULT_CAPS["codex"]
 CC_CAP = DEFAULT_CAPS["cc"]
+OPENCODE_CAP = DEFAULT_CAPS["opencode"]
 
 
 def _positive_int(value):
@@ -25,7 +26,7 @@ def _positive_int(value):
 
 
 def load_caps(root=None):
-    """Resolve caps: {root}/caps.json, then CS_CODEX_CAP/CS_CC_CAP env, then defaults."""
+    """Resolve caps: {root}/caps.json, then CS_<POOL>_CAP env, then defaults."""
     if root is None:
         root = (os.environ.get("CS_HOME") or os.environ.get("CODING_SCHEDULER_HOME")
                 or Path.home() / ".coding-scheduler")
@@ -36,17 +37,19 @@ def load_caps(root=None):
     if not isinstance(data, dict):
         data = {}
     caps = {}
-    for key, env in (("codex", "CS_CODEX_CAP"), ("cc", "CS_CC_CAP")):
+    for key in DEFAULT_CAPS:
+        env = "CS_%s_CAP" % key.upper()
         caps[key] = (_positive_int(data.get(key)) or _positive_int(os.environ.get(env))
                      or DEFAULT_CAPS[key])
     return caps
 
 
 def reload_caps(root=None):
-    """Refresh module-level CODEX_CAP / CC_CAP; invalid entries fall through."""
-    global CODEX_CAP, CC_CAP
+    """Refresh module-level caps; invalid entries fall through."""
+    global CODEX_CAP, CC_CAP, OPENCODE_CAP
     caps = load_caps(root)
     CODEX_CAP, CC_CAP = caps["codex"], caps["cc"]
+    OPENCODE_CAP = caps["opencode"]
     return caps
 
 AREA = {
@@ -118,6 +121,8 @@ def pick_pool(codex_s, cc_s, free_codex, free_cc):
 
 
 def model_for(pool, tier):
+    if pool == "opencode":
+        return "opencode/deepseek-v4.1-flash-free", "max"
     effort = {"L": "low", "M": "medium", "H": "high"}.get(tier, "medium")
     if pool == "codex":
         return "gpt-6.1-sol", effort

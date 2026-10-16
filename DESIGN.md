@@ -18,7 +18,7 @@ cs doctor
 
 ## 硬限制
 
-- Codex ≤ 24 · CC ≤ 6（上限放在 `{CS_HOME}/caps.json`，如 `{"codex":24,"cc":6}`；其次环境变量 `CS_CODEX_CAP` / `CS_CC_CAP`；默认 24/6。tick/status/board/dashboard `/api/state` 每次重读，改文件即生效）
+- Codex ≤ 24 · CC ≤ 6 · OpenCode ≤ 4（上限放在 `{CS_HOME}/caps.json`，如 `{"codex":24,"cc":6,"opencode":4}`；其次环境变量 `CS_CODEX_CAP` / `CS_CC_CAP` / `CS_OPENCODE_CAP`；默认 24/6/4。tick/status/board/dashboard `/api/state` 每次重读，改文件即生效）
 - 禁止子 Agent（prompt 注入）
 - L 档 CC = haiku-5.5
 - 同 worktree 的重叠写锁不并行；跨 worktree 的核心资源用共享锁
@@ -53,13 +53,27 @@ board 渲染时再按原因短句去重，兼容历史记录。
 
 ## 选池
 
-### Open Code / Deepseek（未定：路由策略）
+### Open Code / Deepseek（已决定）
 
-BACKLOG #1：计划增加 Open Code 调度，默认模型候选 `opencode/deepseek-v4.1-flash-free`，用于 L 级。
-**路由策略未定**——何时走 Open Code、何时仍走 Codex/CC，需调研后由产品拍板再改 `affinity.py` / `caps.json`。
-当前生产仍仅 `codex` / `cc` 两池；在路由方案确认前不改调度行为。
+第三池 `opencode` 默认模型 `opencode/deepseek-v4.1-flash-free`，所有 tier 的 effort/variant 固定 `max`。
+`--pin opencode` 仅等待 OpenCode 空位，不 spill；`--pin codex|cc` 保持既有双池逻辑。
+未 pin 的 L 级低风险任务有 OpenCode 空位时优先进入该池；池满则回到原 Codex/CC 选池。
+其余任务不进入 OpenCode，Codex/CC 的副池永远不包含 OpenCode。
 
-亲和分（与 skill local-coding-dispatch 一致）→ 主池有空位就放；否则副池分 ≥45 才 spill；否则留 queue。
+低风险 = `area=research AND read_only`，或同时满足 files ≤3、无 shared_files、risk≠high、
+无高风险文件。文件按仓库相对路径归一化（支持绝对路径、子目录 cwd 和 `..`）；
+高风险前缀为 `lib/core.py`、`lib/affinity.py`、`bin/`、`launchd/`，覆盖这些路径的目录锁也不走低风险通道。
+research + read_only 是独立豁免。非 Git 路径按 cwd 相对路径检查。
+
+原 `pick_pool` 保持双池：亲和分 → 主池有空位就放；否则副池分 ≥45 才 spill；否则留 queue。
+锁仍阻止任何池启动。OpenCode 免费模型跳过 quota 门禁（缺失、null、0 均不阻塞）；
+额度不足不触发跨池回退。OpenCode 的 `--model` override 必须以 `opencode/` 开头，提交选池和启动时均校验。
+
+启动：`opencode run -m <model> --variant max --auto --pure --format json --dir <cwd>`，
+从 worker 外部 prompt.md 读取完整 prompt 作为消息参数。stdout JSONL 保存在 output.jsonl 和 log，
+仅 `type=text` 事件的 `part.text` 顺序写入外部 conclusion.md；命令/解析失败保留非零退出码。
+所有真实 worker 使用 `start_new_session=True`，cancel 沿用进程组清理；fake worker 同样支持第三池。
+status/board/dashboard 暴露三池 counts/caps，doctor 的 `--pool opencode` 要求 opencode CLI。
 
 ## 目录
 
@@ -135,7 +149,7 @@ conclusion 仅输出前 N 行，PR 链接扫描全文并去重，支持 https://
 模板从 `<状态根>/projects/<project>.md` 读取并在 submit 时快照到 prompt_file，
 后改模板不影响已排单；--no-template 可关闭。模型参数按 shell 参数引用传给 worker，
 未指定保持默认；禁止子 agent 的硬规则仍统一置于最终 prompt 开头。
-prompt 末尾统一追加结论输出规则，覆盖模板内旧路径；Codex -o / Claude stdout 都写入
+prompt 末尾统一追加结论输出规则，覆盖模板内旧路径；Codex -o / Claude stdout / OpenCode JSONL text 提取均写入
 worker 外部目录 conclusion.md，不把结论作为代码仓库交付物。仓库根 conclusion*.md 忽略。
 
 ### 路径和检查

@@ -17,8 +17,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import affinity
-from affinity import CC_CAP, CODEX_CAP, model_for, pick_pool, score
-from locks import GitLockResolver, file_conflict
+from affinity import CC_CAP, CODEX_CAP, OPENCODE_CAP, model_for, pick_pool, score
+from locks import GitLockResolver, file_conflict, lock_context
 
 TZ = timezone(timedelta(hours=8))
 NO_SUB = (
@@ -32,7 +32,7 @@ def home():
                 or Path.home() / ".coding-scheduler").expanduser().resolve()
 
 
-_LOADED_CAPS = {"codex": CODEX_CAP, "cc": CC_CAP}
+_LOADED_CAPS = {"codex": CODEX_CAP, "cc": CC_CAP, "opencode": OPENCODE_CAP}
 
 
 def reload_caps(root=None):
@@ -43,11 +43,11 @@ def reload_caps(root=None):
     """
     caps = affinity.reload_caps(root if root is not None else home())
     g = globals()
-    for key, name in (("codex", "CODEX_CAP"), ("cc", "CC_CAP")):
+    for key, name in (("codex", "CODEX_CAP"), ("cc", "CC_CAP"), ("opencode", "OPENCODE_CAP")):
         if g[name] == _LOADED_CAPS[key]:
             g[name] = caps[key]
         _LOADED_CAPS[key] = caps[key]
-    return {"codex": g["CODEX_CAP"], "cc": g["CC_CAP"]}
+    return {key: g[key.upper() + "_CAP"] for key in caps}
 
 
 def ensure(root=None):
@@ -92,7 +92,7 @@ def remove_job(root, folder, jid):
 
 
 def counts(running):
-    c = {"codex": 0, "cc": 0}
+    c = {"codex": 0, "cc": 0, "opencode": 0}
     for j in running:
         if j.get("pool") in c:
             c[j["pool"]] += 1
@@ -312,6 +312,23 @@ def reclaim(root):
     return n
 
 
+def validate_model(pool, model):
+    if pool == "opencode" and model and not model.startswith("opencode/"):
+        raise ValueError("opencode pool requires an --model with opencode/ prefix")
+
+
+def extract_opencode_text(source, destination):
+    """Extract only JSONL text parts; metadata/tool events stay in the worker log."""
+    with Path(source).open() as stream, Path(destination).open("w") as output:
+        for line in stream:
+            event = json.loads(line)
+            if not isinstance(event, dict) or event.get("type") != "text":
+                continue
+            part = event.get("part")
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                output.write(part["text"])
+
+
 def launch(root, job, pool):
     fake = os.environ.get("CS_TEST_FAKE_WORKER") == "1"
     if fake and (not (os.environ.get("CS_HOME") or os.environ.get("CODING_SCHEDULER_HOME"))
@@ -319,6 +336,7 @@ def launch(root, job, pool):
         raise ValueError("CS_TEST_FAKE_WORKER requires an isolated CS_HOME")
     model, effort = model_for(pool, job.get("tier") or "M")
     model = job.get("model") or model
+    validate_model(pool, model)
     jd = remote_dir(job["id"])
     jd.mkdir(parents=True, exist_ok=True)
     body = Path(job["prompt_file"]).read_text()
@@ -352,6 +370,16 @@ def launch(root, job, pool):
                        "-c %s -C %s -o %s - < %s" %
                        (q(model), q("model_reasoning_effort=" + effort), q(cwd),
                         q(str(conclusion)), q(str(prompt_on_disk))))
+        elif pool == "opencode":
+            events = jd / "output.jsonl"
+            # Read the prompt from disk, and keep stdout JSONL separate from stderr.
+            extract = ("import sys; sys.path.insert(0, %r); "
+                       "from core import extract_opencode_text; "
+                       "extract_opencode_text(sys.argv[1], sys.argv[2])" % str(Path(__file__).resolve().parent))
+            command = ("opencode run -m %s --variant max --auto --pure --format json --dir %s "
+                       '\"$(cat %s)\" | tee %s\n/usr/bin/python3 -c %s %s %s' %
+                       (q(model), q(cwd), q(str(prompt_on_disk)), q(str(events)),
+                        q(extract), q(str(events)), q(str(conclusion))))
         else:
             cc_effort = "high" if effort == "medium" else effort
             command = ("claude -p --dangerously-skip-permissions --model %s --effort %s "
@@ -387,6 +415,8 @@ def quota_reasons(root, pools):
         quotas = {}
     reasons = []
     for pool in pools:
+        if pool == "opencode":
+            continue
         value = quotas.get(pool)
         if (isinstance(value, (int, float)) and not isinstance(value, bool)
                 and math.isfinite(value) and value >= 0):
@@ -397,9 +427,27 @@ def quota_reasons(root, pools):
     return reasons
 
 
+def low_risk(job, resolver=None):
+    if job.get("area") == "research" and job.get("read_only"):
+        return True
+    if len(job.get("files") or []) > 3 or job.get("shared_files") or job.get("risk") == "high":
+        return False
+    for entry in lock_context(job, resolver)["locks"]:
+        relative = entry["relpath"]
+        if entry["worktree_root"] is None:
+            # Outside Git, use cwd-relative names instead of the absolute fallback.
+            relative = os.path.relpath(relative, job.get("cwd") or str(Path.home()))
+        if relative.startswith(("lib/core.py", "lib/affinity.py", "bin/", "launchd/")):
+            return False
+        if relative in (".", "lib", "bin", "launchd"):
+            return False
+    return True
+
+
 def check_queue(root, job, running, resolver=None):
     """Evaluate every independent blocker even if a lock already blocks launch."""
     reload_caps(root)
+    resolver = resolver if resolver is not None else GitLockResolver()
     conflicts = file_conflict(job, running, resolver)
     if conflicts:
         job["blocked_by"] = conflicts
@@ -408,13 +456,23 @@ def check_queue(root, job, running, resolver=None):
     c = counts(running)
     cs, ccs = score(job, c, area_counts(running))
     job["affinity"] = {"codex": cs, "cc": ccs}
-    pool, reasons = pick_pool(cs, ccs, CODEX_CAP - c["codex"], CC_CAP - c["cc"])
+    pin = job.get("pin")
+    if pin == "opencode":
+        pool = "opencode" if c["opencode"] < OPENCODE_CAP else None
+        reasons = [] if pool else [{"type": "pool_full", "pool": "opencode",
+                                   "free": OPENCODE_CAP - c["opencode"]}]
+        eligible = ["opencode"]
+    elif (not pin and job.get("tier") == "L" and low_risk(job, resolver)
+          and c["opencode"] < OPENCODE_CAP):
+        pool, reasons, eligible = "opencode", [], ["opencode"]
+    else:
+        pool, reasons = pick_pool(cs, ccs, CODEX_CAP - c["codex"], CC_CAP - c["cc"])
+        primary = "codex" if cs >= ccs else "cc"
+        secondary = "cc" if primary == "codex" else "codex"
+        eligible = [pool] if pool else [primary] + ([secondary] if job["affinity"][secondary] >= 45 else [])
     reasons = [dict(item, type="lock") for item in conflicts] + reasons
     # Quota applies to the selected pool; if capacity prevents selection, report
     # all affinity-eligible pools, so a pool failure does not hide quota failures.
-    primary = "codex" if cs >= ccs else "cc"
-    secondary = "cc" if primary == "codex" else "codex"
-    eligible = [pool] if pool else [primary] + ([secondary] if job["affinity"][secondary] >= 45 else [])
     reasons += quota_reasons(root, eligible)
     job["queue_reasons"] = reasons
     job["last_checked"] = datetime.now(TZ).isoformat()
@@ -535,7 +593,8 @@ def write_board(root):
         "# Coding dispatch board (cs CLI)",
         "",
         "更新：%s UTC+8" % datetime.now(TZ).strftime("%Y-%m-%d %H:%M"),
-        "运行计数：Codex `%s/%s` · CC `%s/%s`" % (c["codex"], CODEX_CAP, c["cc"], CC_CAP),
+        "运行计数：Codex `%s/%s` · CC `%s/%s` · OpenCode `%s/%s`" %
+        (c["codex"], CODEX_CAP, c["cc"], CC_CAP, c["opencode"], OPENCODE_CAP),
         "",
         "| id | project | area | tier | pool | status | cwd | 原因 |",
         "|---|---|---|---|---|---|---|---|",
@@ -583,8 +642,10 @@ def doctor_checks(cwd=None, pool=None):
 
     codex = shutil.which("codex")
     claude = shutil.which("claude")
+    opencode = shutil.which("opencode")
     add("codex_cli", bool(codex), codex or "not on PATH", pool == "codex")
     add("claude_cli", bool(claude), claude or "not on PATH", pool == "cc")
+    add("opencode_cli", bool(opencode), opencode or "not on PATH", pool == "opencode")
 
     try:
         socket.getaddrinfo("github.com", 443)

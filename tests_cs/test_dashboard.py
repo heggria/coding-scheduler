@@ -125,9 +125,9 @@ class DashboardTests(unittest.TestCase):
     def test_snapshot_reloads_caps_json(self):
         self.assertEqual(dashboard.snapshot()["caps"]["cc"], 6)
         (self.root / "caps.json").write_text('{"codex": 11, "cc": 4}')
-        self.assertEqual(dashboard.snapshot()["caps"], {"codex": 11, "cc": 4})
+        self.assertEqual(dashboard.snapshot()["caps"], {"codex": 11, "cc": 4, "opencode": 4})
         (self.root / "caps.json").unlink()
-        self.assertEqual(dashboard.snapshot()["caps"], {"codex": 24, "cc": 6})
+        self.assertEqual(dashboard.snapshot()["caps"], {"codex": 24, "cc": 6, "opencode": 4})
 
     def test_snapshot_never_reclaims_locks_schedules_or_writes(self):
         self.record("dead", "running", pid=None)

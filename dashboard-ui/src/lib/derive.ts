@@ -2,7 +2,7 @@
 // Everything here must tolerate old job records with missing fields.
 import type { Bucket, Job, Pool, Reason, Row, State } from "@/types";
 
-export const POOLS: Pool[] = ["codex", "cc"];
+export const POOLS: Pool[] = ["codex", "cc", "opencode"];
 export const STATUS_LABEL: Record<string, string> = {
   running: "运行中",
   queued: "排队中",

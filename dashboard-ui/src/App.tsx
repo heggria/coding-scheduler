@@ -66,7 +66,7 @@ function readParams() {
     view: pick<View>("view", ["work", "timeline"], "work"),
     tab: pick<Tab>("tab", ["active", "ended", "attention", "all"], "active"),
     project: p.get("project") || "all",
-    pool: pick("pool", ["all", "codex", "cc"], "all"),
+    pool: pick("pool", ["all", "codex", "cc", "opencode"], "all"),
     q: p.get("q") || "",
     job: p.get("job"),
   };

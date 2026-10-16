@@ -162,13 +162,39 @@ class SchedulerTests(unittest.TestCase):
         self.assertIn("error", result)
         self.assertFalse((self.root / "queue/missing.json").exists())
 
+    def test_submit_empty_files_rejected_before_reading_or_writing_prompt(self):
+        for index, flags in enumerate([(), ("--files", ""), ("--files", " , , ")]):
+            jid = "empty-%s" % index
+            result = self.submit(jid, "--area", "backend", "--prompt", "-",
+                                 *flags, expected=2)
+            self.assertEqual(result["schema_version"], "1")
+            self.assertIn("--files is required", result["error"])
+            self.assertEqual(list((self.root / "queue").iterdir()), [])
+        with patch.object(sys, "stdin", Mock(read=Mock(side_effect=AssertionError("read prompt")))), \
+                patch.object(sys, "argv", ["cs", "submit", "--project", "fixture", "--area", "backend",
+                                          "--tier", "M", "--cwd", str(self.cwd), "--prompt", "-"]), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(CLI["main"](), 2)
+        self.assertIn("--files is required", err.getvalue())
+
+    def test_submit_empty_files_exemptions_and_exact_files(self):
+        cases = [("research", "research", []), ("files", "backend", ["--files", " a.py, b.py "])]
+        for area in ("backend", "protocol", "frontend", "ui-copy", "test", "review", "ops-script", "research"):
+            cases.append(("readonly-" + area, area, ["--read-only"]))
+        for jid, area, flags in cases:
+            with self.subTest(jid=jid):
+                self.submit(jid, "--area", area, "--prompt-text", "goal", *flags)
+                job = core.find_job(self.root, jid)
+                self.assertEqual(job["files"], ["a.py", "b.py"] if jid == "files" else [])
+                self.assertTrue(Path(job["prompt_file"]).is_file())
+
     def test_submit_reports_blockers_immediately_with_or_without_tick(self):
         (self.root / "quota.json").write_text('{"codex": 0, "cc": 0}')
         for jid, flags in [("queued", []), ("tick", ["--tick"])]:
             result = self.submit(jid, "--prompt-text", "x", "--pin", "codex", *flags)
             self.assertIn("quota_exhausted", [r["type"] for r in result["job"]["queue_reasons"]])
         output = self.cli("submit", "--project", "p", "--area", "backend", "--tier", "L",
-                          "--cwd", str(self.cwd), "--prompt-text", "x", "--tick")
+                          "--cwd", str(self.cwd), "--prompt-text", "x", "--files", "task.py", "--tick")
         self.assertIn("额度耗尽", output)
 
     def test_submit_tick_json_contains_only_submitted_job(self):
@@ -277,7 +303,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertIn("error", self.submit("same", "--prompt-text", "second", expected=2))
         self.assertEqual((self.root / "queue/same.prompt.md").read_text(), "first")
         args = ("submit", "--project", "p", "--area", "test", "--tier", "L", "--cwd", str(self.cwd),
-                "--prompt-text", "goal", "--json")
+                "--prompt-text", "goal", "--files", "task.py", "--json")
         self.assertNotEqual(json.loads(self.cli(*args))["id"], json.loads(self.cli(*args))["id"])
 
     def test_unknown_dead_worker_without_exit_and_invalid_exit(self):

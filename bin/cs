@@ -56,6 +56,9 @@ def line_count(value):
 
 
 def cmd_submit(args):
+    files = [f.strip() for f in args.files.split(",") if f.strip()]
+    if not files and args.area != "research" and not args.read_only:
+        return error(args, "--files is required (exact file paths); omit only for --area research or --read-only")
     root = ensure()
     if args.idempotency_key:
         for folder in ("queue", "running", "done"):
@@ -83,7 +86,7 @@ def cmd_submit(args):
     job = {
         "id": jid, "project": args.project, "area": args.area, "tier": args.tier,
         "pin": args.pin, "risk": args.risk,
-        "files": [f.strip() for f in args.files.split(",") if f.strip()],
+        "files": files,
         "shared_files": [f.strip() for f in args.lock_shared.split(",") if f.strip()],
         "cwd": str(cwd), "prompt_file": str(prompt_dst),
         "created_at": datetime.now(TZ).isoformat(), "status": "queued",
@@ -260,8 +263,8 @@ def main():
     s.add_argument("--idempotency-key", default=None)
     s.add_argument("--pin", choices=["codex", "cc"], default=None)
     s.add_argument("--risk", choices=["low", "high"], default="low")
-    s.add_argument("--files", default="", help="comma-separated worktree write path prefixes")
-    s.add_argument("--lock-shared", default="", help="comma-separated repo resource path prefixes")
+    s.add_argument("--files", default="", help="comma-separated exact file paths (directory paths warn)")
+    s.add_argument("--lock-shared", default="", help="comma-separated exact resource paths")
     s.add_argument("--id", type=identifier, default=None)
     s.add_argument("--review-of", choices=["codex", "cc"], default=None)
     s.add_argument("--read-only", action="store_true", help="conclusion does not require code delivery")

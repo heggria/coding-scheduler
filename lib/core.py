@@ -463,9 +463,6 @@ def check_queue(root, job, running, resolver=None):
         reasons = [] if pool else [{"type": "pool_full", "pool": "opencode",
                                    "free": OPENCODE_CAP - c["opencode"]}]
         eligible = ["opencode"]
-    elif (not pin and job.get("tier") == "L" and low_risk(job, resolver)
-          and c["opencode"] < OPENCODE_CAP):
-        pool, reasons, eligible = "opencode", [], ["opencode"]
     else:
         pool, reasons = pick_pool(cs, ccs, CODEX_CAP - c["codex"], CC_CAP - c["cc"])
         primary = "codex" if cs >= ccs else "cc"

@@ -238,6 +238,11 @@ def cmd_doctor(args):
     return 1 if failed else 0
 
 
+def cmd_dashboard(args):
+    from dashboard import serve
+    return serve(args, cmd_status)
+
+
 class Parser(argparse.ArgumentParser):
     def error(self, message):
         if "--json" in sys.argv:
@@ -295,11 +300,15 @@ def main():
     d.add_argument("--cwd", default=None)
     d.add_argument("--pool", choices=["codex", "cc"], default=None, help="required worker CLI; other CLI checks only warn")
     d.set_defaults(func=cmd_doctor)
+    dashboard = sp.add_parser("dashboard", help="serve the read-only live dashboard")
+    dashboard.add_argument("--host", default="127.0.0.1")
+    dashboard.add_argument("--port", type=int, default=8787)
+    dashboard.set_defaults(func=cmd_dashboard)
     for parser in (s, t, st, w, c, b, d):
         parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     args = ap.parse_args()
     try:
-        if args.cmd == "wait" or (args.cmd == "status" and args.no_reclaim):
+        if args.cmd in ("wait", "dashboard") or (args.cmd == "status" and args.no_reclaim):
             return args.func(args)
         with state_lock(ensure()):
             return args.func(args)

@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cs 实时看板</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#101721;color:#e3eaf4}body{max-width:1500px;margin:auto;padding:24px}h1{font-size:26px}h2{font-size:19px;margin-top:30px}.bar,.pools{display:flex;gap:18px;align-items:center;flex-wrap:wrap}.card{background:#1c2838;padding:18px 28px;border-radius:10px;font-size:21px}select{background:#1c2838;color:inherit;padding:8px;border:1px solid #55657c;border-radius:6px}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;font-size:14px}th,td{text-align:left;padding:12px;border-bottom:1px solid #334154;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere}th{color:#9bb0c9}td{max-width:380px}small,.muted{color:#a2b3c9}.error{color:#ffb6a6}#tick{line-height:1.9;margin-top:20px}#connection{min-height:24px}
+</style>
+<h1>cs 实时看板 <small>只读 · 每 4 秒刷新</small></h1>
+<div class="bar"><label>项目 <select id="project"><option value="">全部项目</option></select></label><span id="updated" class="muted"></span></div>
+<p id="connection" role="status"></p>
+<div id="pools" class="pools"></div>
+<div id="tick"></div>
+<h2>运行单 <small id="running-count"></small></h2><div class="scroll"><table><thead><tr><th>单号</th><th>项目</th><th>模型 / 池</th><th>已运行</th><th>cwd</th><th>日志最后一行</th></tr></thead><tbody id="running"></tbody></table></div>
+<h2>排队单 <small id="queued-count"></small></h2><div class="scroll"><table><thead><tr><th>单号</th><th>项目</th><th>cwd</th><th>全部排队原因</th></tr></thead><tbody id="queued"></tbody></table></div>
+<h2>最近 24 小时完成单 <small id="done-count"></small></h2><div class="scroll"><table><thead><tr><th>单号</th><th>项目</th><th>结果</th><th>耗时</th><th>退出码</th><th>完成时间</th></tr></thead><tbody id="done"></tbody></table></div>
+<script>
+'use strict';
+let state;
+const $ = id => document.getElementById(id);
+const value = v => v === null || v === undefined || v === '' ? '—' : String(v);
+const yes = v => v === null || v === undefined ? '未知' : v ? '是' : '否';
+const duration = seconds => seconds === null || seconds === undefined ? '未知' : `${Math.floor(seconds/3600)}时 ${Math.floor(seconds%3600/60)}分 ${Math.floor(seconds%60)}秒`;
+const time = text => text ? new Date(text).toLocaleString('zh-CN', {hour12:false}) : '未知';
+const results = {done:'完成', failed:'失败', blocked:'受阻', cancelled:'已取消', unknown:'未知'};
+function rows(id, jobs, columns) {
+  $(id).replaceChildren();
+  $(id+'-count').textContent = jobs.length;
+  if (!jobs.length) {
+    const row = $(id).insertRow(), cell = row.insertCell();
+    cell.colSpan = columns.length; cell.textContent = '暂无记录'; return;
+  }
+  for (const job of jobs) {
+    const row = $(id).insertRow();
+    for (const column of columns) row.insertCell().textContent = value(column(job));
+  }
+}
+function render() {
+  if (!state) return;
+  const data = state.dashboard, project = $('project').value;
+  const filter = jobs => jobs.filter(job => !project || job.project === project);
+  $('pools').replaceChildren();
+  for (const [pool, label] of [['codex','Codex'],['cc','CC']]) {
+    const card = document.createElement('div'); card.className = 'card';
+    card.textContent = `${label} 池 ${state.counts[pool]} / ${state.caps[pool]}`;
+    $('pools').append(card);
+  }
+  const tick = data.tick;
+  $('tick').textContent = `最后一次 tick（日志时间）：${time(tick.last_at)} ｜ tick 报错：${yes(tick.error)} ｜ launchd ${'com.heggria.cs-tick'} 在跑：${yes(tick.launchd.running)} ｜ 上次退出码：${value(tick.launchd.last_exit_status)}`;
+  $('updated').textContent = '更新于 '+time(data.updated_at)+' · 池占用为全局数据';
+  rows('running',filter(data.running),[j=>j.id,j=>j.project,j=>`${value(j.model)} / ${value(j.pool)}`,j=>duration(j.elapsed_seconds),j=>j.cwd,j=>j.log_last_line]);
+  rows('queued',filter(data.queued),[j=>j.id,j=>j.project,j=>j.cwd,j=>j.reason_text || '未记录排队原因']);
+  rows('done',filter(data.done),[j=>j.id,j=>j.project,j=>results[j.status] || j.status,j=>duration(j.elapsed_seconds),j=>j.exit,j=>time(j.finished_at)]);
+}
+async function refresh() {
+  try {
+    const response = await fetch('/api/state',{cache:'no-store'});
+    if (!response.ok) throw new Error('HTTP '+response.status);
+    state = await response.json();
+    const selected = $('project').value;
+    const projects = [...new Set([...state.dashboard.running,...state.dashboard.queued,...state.dashboard.done].map(j=>j.project).filter(Boolean))].sort();
+    if (selected && !projects.includes(selected)) projects.push(selected);
+    $('project').replaceChildren(new Option('全部项目',''),...projects.map(p=>new Option(p,p)));
+    $('project').value = selected;
+    $('connection').textContent = ''; render();
+  } catch (error) {
+    $('connection').className = 'error';
+    $('connection').textContent = '刷新失败，显示上次数据：'+error.message;
+  } finally { setTimeout(refresh,4000); }
+}
+$('project').addEventListener('change',render);
+refresh();
+</script>
+</html>

@@ -74,7 +74,8 @@ launchd 将 stdout 追加重定向到同一 tick.log 时只记 stdout 一份，�
 ## 项目模板与额度快照
 
 模板放在状态根目录 `projects/<project>.md`，默认 `~/.coding-scheduler/projects/<project>.md`。
-submit 自动按“模板 + 空行 + 目标”生成 prompt，`--no-template` 可关闭。
+submit 自动按“模板 + 本单声明 + 目标”生成 prompt；声明列出 cwd、files、shared_files、
+area 和 read-only，空文件列表写“无”。`--no-template` 只关闭项目模板，仍保留声明。
 可复制 [examples/projects/cs.md](examples/projects/cs.md) 后按项目调整。
 worker prompt 仍会添加禁止子 agent 的硬规则。
 任务进入 done / failed / blocked / cancelled 时，将 queue 中的原始 prompt 归档到

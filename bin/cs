@@ -57,6 +57,7 @@ def line_count(value):
 
 def cmd_submit(args):
     files = [f.strip() for f in args.files.split(",") if f.strip()]
+    shared_files = [f.strip() for f in args.lock_shared.split(",") if f.strip()]
     if not files and args.area != "research" and not args.read_only:
         return error(args, "--files is required (exact file paths); omit only for --area research or --read-only")
     root = ensure()
@@ -78,6 +79,15 @@ def cmd_submit(args):
         body = sys.stdin.read()
     else:
         body = Path(args.prompt).expanduser().read_text()
+    declaration = "\n".join([
+        '## 本单声明',
+        '- cwd: ' + str(cwd),
+        '- 可写文件清单 (files): ' + (json.dumps(files, ensure_ascii=False) if files else '无'),
+        '- shared 锁文件 (shared_files): ' + (json.dumps(shared_files, ensure_ascii=False) if shared_files else '无'),
+        '- area: ' + args.area,
+        '- read-only: ' + ('是' if args.read_only else '否'),
+    ])
+    body = declaration + "\n\n" + body
     template = root / "projects" / (args.project + ".md")
     if not args.no_template and template.is_file():
         body = template.read_text().rstrip() + "\n\n" + body
@@ -87,7 +97,7 @@ def cmd_submit(args):
         "id": jid, "project": args.project, "area": args.area, "tier": args.tier,
         "pin": args.pin, "risk": args.risk,
         "files": files,
-        "shared_files": [f.strip() for f in args.lock_shared.split(",") if f.strip()],
+        "shared_files": shared_files,
         "cwd": str(cwd), "prompt_file": str(prompt_dst),
         "created_at": datetime.now(TZ).isoformat(), "status": "queued",
         "pool": None, "affinity": {}, "pid": None, "conclusion": None, "exit": None,

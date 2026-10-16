@@ -140,18 +140,41 @@ class SchedulerTests(unittest.TestCase):
 
     def test_submit_text_stdin_file_and_templates(self):
         (self.root / "projects/fixture.md").write_text("project rules\n")
+        declaration = ('## 本单声明\n- cwd: %s\n- 可写文件清单 (files): 无\n'
+                       '- shared 锁文件 (shared_files): 无\n- area: research\n- read-only: 否'
+                       % self.cwd)
         first = self.submit("inline", "--prompt-text", "goal")
         self.assertEqual(first["schema_version"], "1")
-        self.assertEqual((self.root / "queue/inline.prompt.md").read_text(), "project rules\n\ngoal")
+        self.assertEqual((self.root / "queue/inline.prompt.md").read_text(),
+                         "project rules\n\n" + declaration + "\n\ngoal")
         self.assertEqual(first["job"]["queue_reasons"][-1]["type"], "awaiting_tick")
         self.submit("stdin", "--prompt", "-", stdin="stdin goal")
         self.assertIn("stdin goal", (self.root / "queue/stdin.prompt.md").read_text())
         prompt = self.base / "prompt.md"
         prompt.write_text("file goal")
         self.submit("file", "--prompt", str(prompt))
-        self.assertEqual((self.root / "queue/file.prompt.md").read_text(), "project rules\n\nfile goal")
+        self.assertEqual((self.root / "queue/file.prompt.md").read_text(),
+                         "project rules\n\n" + declaration + "\n\nfile goal")
         self.submit("off", "--prompt-text", "raw", "--no-template")
-        self.assertEqual((self.root / "queue/off.prompt.md").read_text(), "raw")
+        self.assertEqual((self.root / "queue/off.prompt.md").read_text(), declaration + "\n\nraw")
+
+    def test_submit_declaration_for_write_read_only_and_no_template(self):
+        (self.root / "projects/fixture.md").write_text("project rules\n")
+        cases = [
+            ("write", ["--files", " src/a.py, src/b.py ", "--lock-shared", " src/core.py "],
+             '["src/a.py", "src/b.py"]', '["src/core.py"]', "否"),
+            ("readonly", ["--read-only"], "无", "无", "是"),
+            ("no-template", ["--no-template", "--files", "task.py"], '["task.py"]', "无", "否"),
+        ]
+        for jid, flags, files, shared, read_only in cases:
+            with self.subTest(jid=jid):
+                self.submit(jid, "--area", "backend", "--prompt-text", "task goal", *flags)
+                prompt = (self.root / ("queue/%s.prompt.md" % jid)).read_text()
+                declaration = ('## 本单声明\n- cwd: %s\n- 可写文件清单 (files): %s\n'
+                               '- shared 锁文件 (shared_files): %s\n- area: backend\n- read-only: %s'
+                               % (self.cwd, files, shared, read_only))
+                prefix = "" if jid == "no-template" else "project rules\n\n"
+                self.assertEqual(prompt, prefix + declaration + "\n\ntask goal")
 
     def test_prompt_sources_mutually_exclusive_and_required_json_errors(self):
         for extra in [(), ("--prompt-text", "x", "--prompt", "-")]:
@@ -284,6 +307,7 @@ class SchedulerTests(unittest.TestCase):
 
     def test_idempotency_all_folders_and_no_prompt_overwrite(self):
         first = self.submit("original", "--prompt-text", "original", "--idempotency-key", "key")
+        original_prompt = Path(core.find_job(self.root, "original")["prompt_file"]).read_text()
         for folder in ("queue", "running", "done"):
             job = core.find_job(self.root, "original")
             core.remove_job(self.root, "queue", "original")
@@ -295,13 +319,14 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(again["id"], first["id"])
             self.assertIsNone(core.find_job(self.root, "duplicate"))
             saved = core.find_job(self.root, "original")
-            self.assertEqual(Path(saved["prompt_file"]).read_text(), "original")
+            self.assertEqual(Path(saved["prompt_file"]).read_text(), original_prompt)
         self.assertFalse((self.root / "queue/original.prompt.md").exists())
 
     def test_duplicate_id_rejected_and_generated_ids_do_not_collide(self):
         self.submit("same", "--prompt-text", "first")
+        original_prompt = (self.root / "queue/same.prompt.md").read_text()
         self.assertIn("error", self.submit("same", "--prompt-text", "second", expected=2))
-        self.assertEqual((self.root / "queue/same.prompt.md").read_text(), "first")
+        self.assertEqual((self.root / "queue/same.prompt.md").read_text(), original_prompt)
         args = ("submit", "--project", "p", "--area", "test", "--tier", "L", "--cwd", str(self.cwd),
                 "--prompt-text", "goal", "--files", "task.py", "--json")
         self.assertNotEqual(json.loads(self.cli(*args))["id"], json.loads(self.cli(*args))["id"])
@@ -377,6 +402,7 @@ class SchedulerTests(unittest.TestCase):
                                           ("blocked", 0, "STATUS: BLOCKED", "blocked")]:
             with self.subTest(status=expected):
                 self.submit(jid, "--prompt-text", "original " + jid, "--tick")
+                original_prompt = (self.root / "queue" / (jid + ".prompt.md")).read_text()
                 worker = core.remote_dir(jid)
                 (worker / "exit").write_text(str(code))
                 (worker / "conclusion.md").write_text(body)
@@ -384,18 +410,19 @@ class SchedulerTests(unittest.TestCase):
                 job = core.find_job(self.root, jid)
                 self.assertEqual(job["status"], expected)
                 self.assertEqual(job["prompt_file"], str(worker / "prompt.md"))
-                self.assertEqual(Path(job["prompt_file"]).read_text(), "original " + jid)
+                self.assertEqual(Path(job["prompt_file"]).read_text(), original_prompt)
                 self.assertFalse((self.root / "queue" / (jid + ".prompt.md")).exists())
 
     def test_cancel_archives_queued_and_running_prompts(self):
         for jid, flags in [("queued", []), ("running", ["--tick"])]:
             with self.subTest(folder=jid):
                 self.submit(jid, "--prompt-text", "cancel " + jid, *flags)
+                original_prompt = (self.root / "queue" / (jid + ".prompt.md")).read_text()
                 self.cli("cancel", jid, "--json")
                 job = core.find_job(self.root, jid)
                 self.assertEqual(job["status"], "cancelled")
                 self.assertEqual(job["prompt_file"], str(core.remote_dir(jid) / "prompt.md"))
-                self.assertEqual(Path(job["prompt_file"]).read_text(), "cancel " + jid)
+                self.assertEqual(Path(job["prompt_file"]).read_text(), original_prompt)
                 self.assertFalse((self.root / "queue" / (jid + ".prompt.md")).exists())
 
     def test_status_read_only_preserves_all_state_and_default_still_reclaims(self):

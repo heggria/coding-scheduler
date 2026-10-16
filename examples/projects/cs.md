@@ -8,6 +8,11 @@
 
 ## 结论格式
 
+结论必须包含独立的结构化状态行：成功写 `STATUS: DONE`，受阻写 `STATUS: BLOCKED`。
+仅去除行首尾空白后整行精确等于 `STATUS: BLOCKED`（区分大小写）才标记 blocked；
+正文中的未合并/只读/未提交等自然语言不参与分类，FAIL 也不是受阻标记。
+退出码优先：124 或缺失/无效为 unknown，其他非零为 failed；exit 0 缺失/空结论为 unknown。
+
 写 conclusion：改动摘要、commit SHA、验证命令与结果、产物路径、遗留问题。
 结论写到 worker prompt 指定的外部产物路径（默认 ~/.remote-jobs/<id>/conclusion.md）；
 不要在仓库 worktree 创建、暂存或提交 conclusion*.md。research/只读单只交付分析结论，

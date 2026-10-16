@@ -35,7 +35,7 @@ cs board --json
   不重复启动；key 在状态根目录内全局唯一。显式 `--id` 重复则报错，自动 ID 带随机尾缀。
 - `--model` 透传给所选 codex/claude，省略沿用默认模型；`research` 和显式 `--read-only`
   的单以分析结论为交付，结论提到“未提交/未推送/只读”等不再误判 blocked。
-  非零退出、超时及缺失/空结论的判定仍保留；其他编码单沿用未交付标记检查。
+  所有任务统一使用下述退出证据与结构化状态规则，不扫描自然语言未交付短语。
 - submit 默认只排队，并立即返回全部已知阻塞原因和 `awaiting_tick`；`--tick` 才尝试启动。
   `submit --tick --json` 只返回本单的状态、原因和摘要，不包含其他单或全局 schedule。
 - 每次 tick 更新 `last_checked`（ISO）、全部 `queue_reasons`，board 的“原因”列显示短句。
@@ -51,7 +51,11 @@ cs board --json
 - status 默认回收任务并重写 board；`--no-reclaim`（别名 `--read-only`）只读取当前记录，
   不回收、不初始化目录、不创建锁文件、不重写 board。并发 tick 时读取结果可能跨越状态转换。
 - worker 消失且无有效 exit 文件、或 exit=124 超时记 `unknown`，不当成功/失败；
-  wait 自身超时不改任务状态。exit=0 但缺少/空 conclusion 记 blocked。
+  wait 自身超时不改任务状态。exit=0 但缺少/空 conclusion 记 unknown（missing_conclusion）。
+- exit=0 且结论非空时，仅独立行 `STATUS: BLOCKED` 记 blocked；逐行去除首尾空白后
+  区分大小写精确匹配，不接受 Markdown 包装、尾随原因、正文提及或 FAIL。
+  其余记 done，适用于编码、research 和 read-only 单；成功结论应写 `STATUS: DONE`。
+  自然语言“未合并/只读/未提交”等不参与判定；其他非零退出（除 124）记 failed。
 - doctor 的非 Git、DNS、信任提示及与所选池无关的 CLI 检查失败为 WARN；
   `--pool codex|cc` 指定的 CLI 缺失、cwd 无效、Git 元数据不可写仍为 FAIL。
   `claude_trusted_dir_hint` 仅检查 `.claude.json` 中 cwd 的准确项目路径及

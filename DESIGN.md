@@ -88,9 +88,13 @@ wait 默认每次仅在回收和读取时持锁；可选 --tick 在每轮等待�
 
 queue/running/done 目录保留，done 下可保存 done/failed/blocked/cancelled/unknown。
 没有有效 exit 且 PID 已消失，或 exit=124 表示 worker 超时，结果为 unknown；
-exit=0 无有效 conclusion 为 blocked。旧记录缺少新增字段按空/None 读取，不强制迁移。
-area=research 或显式 --read-only 豁免结论的未交付关键词扫描，exit=0 且有非空结论即 done；
-其他单保留原扫描。该豁免不改变非零退出、124/无退出证据、空结论的判定。
+exit=0 无有效 conclusion 为 unknown，outcome_reason=missing_conclusion。
+其他非零退出为 failed；退出码判定优先于结论。旧记录缺少新增字段按空/None 读取，不强制迁移。
+所有 area/read_only 统一规则：exit=0 且非空结论只在存在独立 `STATUS: BLOCKED` 行时为 blocked，
+block_reasons=["STATUS: BLOCKED"]；否则 done。逐行 strip 后区分大小写精确匹配，
+不接受 Markdown 包装、尾随原因或 FAIL 标记，也不扫描任何自然语言短语。
+模板要求成功写独立 `STATUS: DONE` 行、受阻写独立 `STATUS: BLOCKED` 行；
+旧非空结论无需补写状态行即可按相同规则回收。
 真实 worker 脚本用 EXIT trap 写退出码并原子替换 exit，非零退出不再丢失结果文件。
 
 ### 排队解释与额度边界

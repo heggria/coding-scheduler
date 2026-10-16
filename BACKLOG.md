@@ -9,7 +9,7 @@
 4. 生产状态根目录约 142 个续跑 / bak / tgz 文件需清理（本次不删除）。
 
 ## 已完成
-- wave1：status 回收僵尸、exit0 但无结论→blocked、doctor 预检、cancel --superseded-by。
+- wave1：status 回收僵尸、exit0 但无结论→unknown（已修正早期 blocked 规则）、doctor 预检、cancel --superseded-by。
 - launchd 每 60s 自动 tick（`com.heggria.cs-tick`）。
 - Codex/CC 完全访问权限（bypass sandbox / skip-permissions）。
 - B：repo/worktree/file 锁、blocked_by、跨 worktree `--lock-shared`（基线 cf564b4）。

@@ -164,37 +164,9 @@ def job_summary(job, lines=20):
             result["changed_files"] = [name for name in names.split("\0") if name]
     return result
 
-# Conclusion phrases that mean "process exited 0 but work was not delivered".
-BLOCKED_MARKERS = (
-    "未推送",
-    "尚未推送",
-    "未提交",
-    "未开 pr",
-    "未合并",
-    "未修改 pr",
-    "沙箱",
-    "只读",
-    "read-only",
-    "readonly",
-    "github 无法",
-    "github api",
-    "dns",
-    "trusted directory",
-    "trusted-dir",
-    "permission denied",
-    "需要审批",
-    "策略为 never",
-    "禁止提权",
-    "仍受阻",
-    "需在允许写入",
-    "修复尚未提交",
-    "也未提交",
-    "未启动子",
-)
-
 
 def classify_outcome(exit_code, conclusion_path, job=None):
-    """No completion evidence is unknown; exit 124 denotes timeout."""
+    """Exit evidence takes precedence; only a whole-line STATUS: BLOCKED blocks."""
     if exit_code is None or exit_code == 124:
         return "unknown", None
     if exit_code != 0:
@@ -204,12 +176,10 @@ def classify_outcome(exit_code, conclusion_path, job=None):
     except OSError:
         text = ""
     if not text.strip():
-        return "blocked", ["missing_conclusion"]
-    # Research/read-only delivery is the conclusion itself, not a commit/PR.
-    if job and (job.get("area") == "research" or job.get("read_only")):
-        return "done", None
-    hits = [m for m in BLOCKED_MARKERS if m.lower() in text.lower()]
-    return ("blocked", hits[:5]) if hits else ("done", None)
+        return "unknown", None
+    if any(line.strip() == "STATUS: BLOCKED" for line in text.splitlines()):
+        return "blocked", ["STATUS: BLOCKED"]
+    return "done", None
 
 
 def reclaim(root):
@@ -238,7 +208,12 @@ def reclaim(root):
         status, hits = classify_outcome(job["exit"], job["conclusion"], job)
         job["status"] = status
         if status == "unknown":
-            job["outcome_reason"] = "worker_timeout" if job["exit"] == 124 else "missing_or_invalid_exit"
+            if job["exit"] == 124:
+                job["outcome_reason"] = "worker_timeout"
+            elif job["exit"] is None:
+                job["outcome_reason"] = "missing_or_invalid_exit"
+            else:
+                job["outcome_reason"] = "missing_conclusion"
         if hits:
             job["block_reasons"] = hits
         job["finished_at"] = datetime.now(TZ).isoformat()

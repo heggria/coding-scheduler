@@ -1,0 +1,9 @@
+conclusion：
+
+- 实现完成：shadcn/ui 看板、主题记忆、筛选、动效、生命周期时间线及图表；后端改为只读快照与安全静态服务，修正 tick 健康判断。
+- Commit：`73463639c7b5f3163b4894faf924aa6879d06a2b`
+- 验证：`/usr/bin/python3 -m unittest discover -s tests_cs` **67 项全绿**；`cd dashboard-ui && npm install && npm run build` 成功；`npm run test:browser` 通过，curl `/` 和 `/api/state` 均 **200**。
+- 改动文件：`dashboard-ui/`、`lib/dashboard.py`、`lib/dashboard_dist/`、`tests_cs/test_dashboard.py`、`.gitignore`；删除旧 `lib/dashboard.html`。
+- 产物：[构建入口](/Users/heggria/code/worktrees/cs-dashboard/lib/dashboard_dist/index.html)、[亮色截图](/Users/heggria/cs-dashboard-v2-light.png)、[暗色截图](/Users/heggria/cs-dashboard-v2-dark.png)。截图为隔离夹具、1440 宽全页。
+- 遗留：无阻塞；旧单缺少时间戳时无法补出历史耗时。
+- 状态：已本地提交，工作树干净；未 push、未合并、未部署。临时服务已关闭。

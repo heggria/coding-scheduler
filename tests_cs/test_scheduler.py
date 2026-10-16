@@ -326,8 +326,8 @@ class SchedulerTests(unittest.TestCase):
         self.assertIn("last_checked", core.find_job(self.root, "live"))
         for jid, code, text, status in [("ok", 0, "Delivered", "done"),
                                        ("failed", 7, "Error", "failed"),
-                                       ("blocked", 0, "未提交", "blocked"),
-                                       ("empty", 0, "", "blocked")]:
+                                       ("blocked", 0, "STATUS: BLOCKED", "blocked"),
+                                       ("empty", 0, "", "unknown")]:
             self.record(jid, "running", pid=None, status="running")
             jd = core.remote_dir(jid)
             jd.mkdir(parents=True)
@@ -335,11 +335,46 @@ class SchedulerTests(unittest.TestCase):
             (jd / "conclusion.txt").write_text(text)
             core.reclaim(self.root)
             self.assertEqual(core.find_job(self.root, jid)["status"], status)
+            if jid == "empty":
+                self.assertEqual(core.find_job(self.root, jid)["outcome_reason"], "missing_conclusion")
+
+    def test_classify_outcome_requires_exact_structured_marker(self):
+        conclusion = self.base / "result.txt"
+        for body, expected in [
+                ("STATUS: BLOCKED", "blocked"),
+                ("Summary\n  STATUS: BLOCKED  \nReason", "blocked"),
+                ("STATUS: DONE\n未合并/只读/未提交", "done"),
+                ("Mention STATUS: BLOCKED in prose", "done"),
+                ("STATUS: BLOCKED because waiting", "done"),
+                ("status: blocked", "done"),
+                ("FAIL is an ordinary word here", "done"),
+                ("   \n", "unknown")]:
+            conclusion.write_text(body)
+            for job in (None, {"area": "frontend"}, {"area": "research"}, {"read_only": True}):
+                with self.subTest(body=body, job=job):
+                    self.assertEqual(core.classify_outcome(0, conclusion, job)[0], expected)
+            for code, status in [(7, "failed"), (124, "unknown"), (None, "unknown")]:
+                self.assertEqual(core.classify_outcome(code, conclusion)[0], status)
+        conclusion.unlink()
+        self.assertEqual(core.classify_outcome(0, conclusion), ("unknown", None))
+        self.assertEqual(core.classify_outcome(0, None), ("unknown", None))
+
+    def test_dashboard_v2_conclusion_is_done(self):
+        body = (REPO / "tests_cs/fixtures/cs-dashboard-v2.txt").read_text()
+        self.record("dashboard-v2", "running", status="running", area="frontend")
+        worker = core.remote_dir("dashboard-v2")
+        worker.mkdir(parents=True)
+        (worker / "exit").write_text("0")
+        (worker / "conclusion.md").write_text(body)
+        core.reclaim(self.root)
+        job = core.find_job(self.root, "dashboard-v2")
+        self.assertEqual(job["status"], "done")
+        self.assertFalse(job.get("block_reasons"))
 
     def test_terminal_outcomes_archive_queue_prompt(self):
         for jid, code, body, expected in [("ok", 0, "Delivered", "done"),
                                           ("error", 7, "Error", "failed"),
-                                          ("empty", 0, "", "blocked")]:
+                                          ("blocked", 0, "STATUS: BLOCKED", "blocked")]:
             with self.subTest(status=expected):
                 self.submit(jid, "--prompt-text", "original " + jid, "--tick")
                 worker = core.remote_dir(jid)
@@ -401,7 +436,7 @@ class SchedulerTests(unittest.TestCase):
             result = json.loads(self.cli("wait", jid, "--timeout", "0"))["jobs"][0]
             self.assertEqual(result["status"], "done")
             self.assertEqual(result["conclusion"], [text])
-        for code, body, expected in [(7, text, "failed"), (124, text, "unknown"), (0, "", "blocked")]:
+        for code, body, expected in [(7, text, "failed"), (124, text, "unknown"), (0, "", "unknown")]:
             conclusion.write_text(body)
             self.assertEqual(core.classify_outcome(code, conclusion, {"read_only": True})[0], expected)
 

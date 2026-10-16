@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from affinity import CC_CAP, CODEX_CAP, model_for, pick_pool, score
+from locks import GitLockResolver, file_conflict
 
 TZ = timezone(timedelta(hours=8))
 NO_SUB = (
@@ -62,19 +63,6 @@ def area_counts(running):
         k = (j.get("pool"), j.get("area"))
         d[k] = d.get(k, 0) + 1
     return d
-
-
-def file_conflict(job, running):
-    mine = [f.rstrip("/") for f in (job.get("files") or [])]
-    if not mine:
-        return False
-    for other in running:
-        for f in other.get("files") or []:
-            f = f.rstrip("/")
-            for m in mine:
-                if f == m or f.startswith(m + "/") or m.startswith(f + "/"):
-                    return True
-    return False
 
 
 def remote_dir(jid):
@@ -244,8 +232,9 @@ def launch(root, job, pool):
     return job
 
 
-def tick(root):
+def tick(root, resolver=None):
     root = ensure(root)
+    resolver = resolver if resolver is not None else GitLockResolver()
     reclaimed = reclaim(root)
     running = load_jobs(root, "running")
     queued = load_jobs(root, "queue")
@@ -261,8 +250,15 @@ def tick(root):
         )
 
     for job in sorted(queued, key=sk):
-        if file_conflict(job, running):
+        conflicts = file_conflict(job, running, resolver)
+        if conflicts:
+            if job.get("blocked_by") != conflicts:
+                job["blocked_by"] = conflicts
+                write_job(root, "queue", job)
             continue
+        if "blocked_by" in job:
+            del job["blocked_by"]
+            write_job(root, "queue", job)
         cs, ccs = score(job, c, by_area)
         job["affinity"] = {"codex": cs, "cc": ccs}
         pool = pick_pool(cs, ccs, CODEX_CAP - c["codex"], CC_CAP - c["cc"])

@@ -14,6 +14,7 @@ LIB = Path(__file__).resolve().parents[1] / "lib"
 sys.path.insert(0, str(LIB))
 
 from affinity import CC_CAP, CODEX_CAP  # noqa: E402
+from locks import directory_locks, lock_context  # noqa: E402
 from core import (  # noqa: E402
     doctor_checks,
     ensure,
@@ -40,6 +41,7 @@ def cmd_submit(args):
     prompt_dst = root / "queue" / f"{jid}.prompt.md"
     prompt_dst.write_text(prompt_src.read_text())
     files = [f.strip() for f in (args.files or "").split(",") if f.strip()]
+    shared_files = [f.strip() for f in (args.lock_shared or "").split(",") if f.strip()]
     job = {
         "id": jid,
         "project": args.project,
@@ -48,6 +50,7 @@ def cmd_submit(args):
         "pin": args.pin,
         "risk": args.risk,
         "files": files,
+        "shared_files": shared_files,
         "cwd": str(Path(args.cwd).expanduser().resolve()),
         "prompt_file": str(prompt_dst),
         "created_at": datetime.now(TZ).isoformat(),
@@ -60,6 +63,9 @@ def cmd_submit(args):
     }
     if args.review_of:
         job["review_of"] = args.review_of
+    job["lock_ctx"] = lock_context(job)
+    for path in directory_locks(job["lock_ctx"]):
+        print(f"WARNING: directory lock {path!r} covers all descendant paths", file=sys.stderr)
     write_job(root, "queue", job)
     print(jid)
     if args.tick:
@@ -151,7 +157,10 @@ def cmd_doctor(args):
 
 
 def main():
-    ap = argparse.ArgumentParser(prog="cs", description="Lightweight coding scheduler CLI (no daemon)")
+    ap = argparse.ArgumentParser(
+        prog="cs", description="Lightweight coding scheduler CLI (no daemon)",
+        epilog="submit locks: --files a,b (worktree write); --lock-shared a,b (cross-worktree repo resource)",
+    )
     sp = ap.add_subparsers(dest="cmd", required=True)
 
     s = sp.add_parser("submit", help="enqueue a job")
@@ -162,7 +171,8 @@ def main():
     s.add_argument("--prompt", required=True)
     s.add_argument("--pin", choices=["codex", "cc"], default=None)
     s.add_argument("--risk", choices=["low", "high"], default="low")
-    s.add_argument("--files", default="", help="comma-separated path prefixes")
+    s.add_argument("--files", default="", help="comma-separated worktree write path prefixes")
+    s.add_argument("--lock-shared", default="", help="comma-separated repo resource path prefixes (across worktrees)")
     s.add_argument("--id", default=None)
     s.add_argument("--review-of", dest="review_of", choices=["codex", "cc"], default=None)
     s.add_argument("--tick", action="store_true", help="run one schedule pass after submit")

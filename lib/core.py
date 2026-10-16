@@ -47,10 +47,21 @@ def load_jobs(root, folder):
 
 
 def write_job(root, folder, job):
+    prompt = root / "queue" / (job["id"] + ".prompt.md")
+    archive_prompt = (folder == "done" and
+                      job.get("status") in ("done", "failed", "blocked", "cancelled") and
+                      prompt.is_file())
+    if archive_prompt:
+        destination = remote_dir(job["id"]) / "prompt.md"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(prompt, destination)
+        job["prompt_file"] = str(destination)
     path = root / folder / ("%s.json" % job["id"])
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(job, ensure_ascii=False, indent=2) + "\n")
     temporary.replace(path)
+    if archive_prompt:
+        prompt.unlink()
 
 
 def remove_job(root, folder, jid):

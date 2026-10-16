@@ -26,6 +26,7 @@ printf '%s\n' '目标与验收条件' | cs submit --project cs --area test --tie
   --cwd "$PWD" --prompt - --tick --json
 cs wait job-a job-b --tick --timeout 600 --lines 10
 cs status job-a --json --lines 20
+cs status --no-reclaim --json
 cs board --json
 ```
 
@@ -47,6 +48,8 @@ cs board --json
   Git 任务 start 时记 `base_sha`，摘要在 cwd 用 `git diff --stat <base_sha> -- .` 及文件列表，
   包括起点后的已提交和未提交跟踪文件改动；未跟踪文件不在 git diff 中。
   非 Git、旧单缺少 base_sha 或 Git 查询失败时省略 diff 字段。
+- status 默认回收任务并重写 board；`--no-reclaim`（别名 `--read-only`）只读取当前记录，
+  不回收、不初始化目录、不创建锁文件、不重写 board。并发 tick 时读取结果可能跨越状态转换。
 - worker 消失且无有效 exit 文件、或 exit=124 超时记 `unknown`，不当成功/失败；
   wait 自身超时不改任务状态。exit=0 但缺少/空 conclusion 记 blocked。
 - doctor 的非 Git、DNS、信任提示及与所选池无关的 CLI 检查失败为 WARN；
@@ -70,6 +73,9 @@ launchd 将 stdout 追加重定向到同一 tick.log 时只记 stdout 一份，�
 submit 自动按“模板 + 空行 + 目标”生成 prompt，`--no-template` 可关闭。
 可复制 [examples/projects/cs.md](examples/projects/cs.md) 后按项目调整。
 worker prompt 仍会添加禁止子 agent 的硬规则。
+任务进入 done / failed / blocked / cancelled 时，将 queue 中的原始 prompt 归档到
+`~/.remote-jobs/<id>/prompt.md`（隔离时为 `<状态根>/workers/<id>/prompt.md`），
+更新任务记录的 `prompt_file` 并删除 queue 副本；归档原文替换 worker 运行时添加规则的版本。
 最终结论统一在外部 worker 目录 `~/.remote-jobs/<id>/conclusion.md`，隔离时为
 `<状态根>/workers/<id>/conclusion.md`；prompt 中明确禁止在仓库创建、暂存、提交
 `conclusion*.md`，根目录同名文件也由 `.gitignore` 排除。旧 worker 的 conclusion.txt 仍可回收。
@@ -99,5 +105,6 @@ worker prompt 仍会添加禁止子 agent 的硬规则。
 冒烟脚本只读复制 `CS_HOME`（兼容旧变量，未设置则 `~/.coding-scheduler`）
 到 `/tmp/cs-AD-smoke-*`（源不存在则初始化空状态），
 归档副本中旧任务/额度配置，设置隔离 `CS_HOME` 和仅测试用 `CS_TEST_FAKE_WORKER=1`，
-执行 submit → tick → wait → status → board。它检查源文件指纹不变并保留 JSON 证据。
+执行 submit → tick → wait → status → board。它检查新任务状态和产物均写入临时 CS_HOME，
+并保留 JSON 证据；源目录可由生产 launchd 并发更新，不比较源目录指纹。
 假 worker 同步生成 log/conclusion/exit，拒绝默认生产状态根，不执行真实 codex/claude。

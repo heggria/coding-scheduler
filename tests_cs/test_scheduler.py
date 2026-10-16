@@ -268,7 +268,9 @@ class SchedulerTests(unittest.TestCase):
             self.assertTrue(again["existing"])
             self.assertEqual(again["id"], first["id"])
             self.assertIsNone(core.find_job(self.root, "duplicate"))
-        self.assertEqual((self.root / "queue/original.prompt.md").read_text(), "original")
+            saved = core.find_job(self.root, "original")
+            self.assertEqual(Path(saved["prompt_file"]).read_text(), "original")
+        self.assertFalse((self.root / "queue/original.prompt.md").exists())
 
     def test_duplicate_id_rejected_and_generated_ids_do_not_collide(self):
         self.submit("same", "--prompt-text", "first")
@@ -307,6 +309,61 @@ class SchedulerTests(unittest.TestCase):
             (jd / "conclusion.txt").write_text(text)
             core.reclaim(self.root)
             self.assertEqual(core.find_job(self.root, jid)["status"], status)
+
+    def test_terminal_outcomes_archive_queue_prompt(self):
+        for jid, code, body, expected in [("ok", 0, "Delivered", "done"),
+                                          ("error", 7, "Error", "failed"),
+                                          ("empty", 0, "", "blocked")]:
+            with self.subTest(status=expected):
+                self.submit(jid, "--prompt-text", "original " + jid, "--tick")
+                worker = core.remote_dir(jid)
+                (worker / "exit").write_text(str(code))
+                (worker / "conclusion.md").write_text(body)
+                self.cli("status", jid, "--json")
+                job = core.find_job(self.root, jid)
+                self.assertEqual(job["status"], expected)
+                self.assertEqual(job["prompt_file"], str(worker / "prompt.md"))
+                self.assertEqual(Path(job["prompt_file"]).read_text(), "original " + jid)
+                self.assertFalse((self.root / "queue" / (jid + ".prompt.md")).exists())
+
+    def test_cancel_archives_queued_and_running_prompts(self):
+        for jid, flags in [("queued", []), ("running", ["--tick"])]:
+            with self.subTest(folder=jid):
+                self.submit(jid, "--prompt-text", "cancel " + jid, *flags)
+                self.cli("cancel", jid, "--json")
+                job = core.find_job(self.root, jid)
+                self.assertEqual(job["status"], "cancelled")
+                self.assertEqual(job["prompt_file"], str(core.remote_dir(jid) / "prompt.md"))
+                self.assertEqual(Path(job["prompt_file"]).read_text(), "cancel " + jid)
+                self.assertFalse((self.root / "queue" / (jid + ".prompt.md")).exists())
+
+    def test_status_read_only_preserves_all_state_and_default_still_reclaims(self):
+        self.submit("finished", "--prompt-text", "goal", "--tick")
+        self.record("live", "running", status="running", pid=os.getpid())
+        (self.root / ".lock").unlink()
+
+        def snapshot():
+            return {str(p.relative_to(self.root)): (p.read_bytes(), p.stat().st_mtime_ns)
+                    for p in self.root.rglob("*") if p.is_file()}
+
+        before = snapshot()
+        for flag in ("--no-reclaim", "--read-only"):
+            data = json.loads(self.cli("status", flag, "--json"))
+            self.assertEqual(data["reclaimed"], 0)
+            self.assertEqual(len(data["running"]), 2)
+            job = json.loads(self.cli("status", "finished", flag, "--json"))["job"]
+            self.assertEqual(job["status"], "running")
+            self.assertEqual(snapshot(), before)
+        job = json.loads(self.cli("status", "finished", "--json"))["job"]
+        self.assertEqual(job["status"], "done")
+        self.assertNotEqual(snapshot(), before)
+
+    def test_status_read_only_does_not_initialize_missing_home(self):
+        missing = self.base / "missing"
+        with patch.dict(os.environ, {"CS_HOME": str(missing)}):
+            self.assertEqual(json.loads(self.cli("status", "--read-only", "--json"))["running"], [])
+            self.cli("status", "absent", "--no-reclaim", "--json", expected=1)
+        self.assertFalse(missing.exists())
 
     def test_research_and_explicit_read_only_do_not_require_code_delivery(self):
         text = "分析完成。未提交代码，未推送，未开 PR；只读研究未启动子 agent。"

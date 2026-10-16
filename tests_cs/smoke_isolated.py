@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Read-only copy of production state, then a fake-worker-only CLI smoke."""
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,23 +10,9 @@ import tempfile
 REPO = Path(__file__).resolve().parents[1]
 
 
-def fingerprint(root):
-    if not root.exists():
-        return None
-    digest = hashlib.sha256()
-    for path in sorted(root.rglob("*")):
-        digest.update(str(path.relative_to(root)).encode())
-        if path.is_symlink():
-            digest.update(os.readlink(path).encode())
-        elif path.is_file():
-            digest.update(path.read_bytes())
-    return digest.hexdigest()
-
-
 def main():
     source = Path(os.environ.get("CS_HOME") or os.environ.get("CODING_SCHEDULER_HOME")
                   or Path.home() / ".coding-scheduler").expanduser().resolve()
-    before = fingerprint(source)
     smoke_dir = Path(tempfile.mkdtemp(prefix="cs-AD-smoke-", dir="/tmp")).resolve()
     root = smoke_dir / "state"
     if source.exists():
@@ -83,8 +68,19 @@ def main():
     board = Path(cs("board")["path"])
     assert "原因" in board.read_text()
     assert (root / "workers" / jid / "log").read_text() == "test fake worker\n"
-    assert fingerprint(source) == before, "production source changed during smoke; investigate external writes"
-    report = {"source_exists": source.exists(), "source_unchanged": True,
+    assert board == root / "board.md"
+    assert (root / ".lock").is_file()
+    for job_id in (jid, "wait-tick"):
+        job_path = root / "done" / (job_id + ".json")
+        job = json.loads(job_path.read_text())
+        worker = root / "workers" / job_id
+        for field, name in (("prompt_file", "prompt.md"), ("log", "log"),
+                            ("conclusion", "conclusion.md")):
+            assert Path(job[field]) == worker / name
+            assert Path(job[field]).is_file()
+        assert not (root / "queue" / (job_id + ".prompt.md")).exists()
+        assert not (root / "running" / (job_id + ".json")).exists()
+    report = {"source_exists": source.exists(), "cs_home_isolated": True,
               "fake_worker": True, "directory": str(smoke_dir), "steps": records}
     (smoke_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, ensure_ascii=False))

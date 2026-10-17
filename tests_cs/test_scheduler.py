@@ -323,7 +323,7 @@ class SchedulerTests(unittest.TestCase):
         worker = core.remote_dir(job["id"])
         script = worker / "run.sh"
         self.assertIn("opencode run -m", script.read_text())
-        self.assertIn("--variant max --auto --pure --format json --dir", script.read_text())
+        self.assertIn("#max' --auto --format json", script.read_text())
         fake_bin = self.base / "fake-opencode"
         fake_bin.mkdir()
         executable = fake_bin / "opencode"
@@ -338,8 +338,7 @@ class SchedulerTests(unittest.TestCase):
         result = subprocess.run(["/bin/bash", str(script)], env=env, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         args = json.loads((self.cwd / "args.json").read_text())
-        self.assertEqual(args[:-1], ["run", "-m", model, "--variant", "max", "--auto", "--pure",
-                                   "--format", "json", "--dir", str(self.cwd)])
+        self.assertEqual(args[:-1], ["run", "-m", model + "#max", "--auto", "--format", "json"])
         self.assertEqual(args[-1], (worker / "prompt.md").read_text().rstrip("\n"))
         self.assertEqual((worker / "conclusion.md").read_text(), "STATUS: DONE\n完成\n")
         self.assertEqual((worker / "exit").read_text(), "0\n")

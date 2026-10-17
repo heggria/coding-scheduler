@@ -110,7 +110,7 @@ Codex/CC/OpenCode 并发上限默认 24/6/32，运行时读取 `{CS_HOME}/caps.j
 低风险为 research + read-only，或 files ≤3、无 shared_files、risk≠high 且无高风险路径；
 仓库相对路径前缀 `lib/core.py`、`lib/affinity.py`、`bin/`、`launchd/` 为高风险。
 `--pin opencode` 只等待此池，`--pin codex|cc` 保持旧逻辑；OpenCode 不参与 spill。
-默认模型 `opencode/deepseek-v4.1-flash`，variant 固定 `max`；此池为订阅，豁免 quota.json 门禁。
+默认模型 `opencode/deepseek-v4.1-flash`，variant 固定 `max`（2.x CLI 以 `model#max` 传入）；此池为订阅，豁免 quota.json 门禁。
 JSONL text parts 提取为外部 conclusion.md，原始事件留在 worker 的 output.jsonl / log。
 
 可选真实冒烟命令（不属于自动测试；显式执行才调用真实模型）：

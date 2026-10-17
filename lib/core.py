@@ -377,9 +377,10 @@ def launch(root, job, pool):
             extract = ("import sys; sys.path.insert(0, %r); "
                        "from core import extract_opencode_text; "
                        "extract_opencode_text(sys.argv[1], sys.argv[2])" % str(Path(__file__).resolve().parent))
-            command = ("opencode run -m %s --variant max --auto --pure --format json --dir %s "
+            # OpenCode 2.x: variant is part of the model id; run.sh already cd's into cwd.
+            command = ("opencode run -m %s --auto --format json "
                        '\"$(cat %s)\" | tee %s\n/usr/bin/python3 -c %s %s %s' %
-                       (q(model), q(cwd), q(str(prompt_on_disk)), q(str(events)),
+                       (q(model + "#max"), q(str(prompt_on_disk)), q(str(events)),
                         q(extract), q(str(events)), q(str(conclusion))))
         else:
             cc_effort = "high" if effort == "medium" else effort

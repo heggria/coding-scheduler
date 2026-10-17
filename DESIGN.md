@@ -58,9 +58,13 @@ board 渲染时再按原因短句去重，兼容历史记录。
 
 第三池 `opencode` 默认模型 `opencode/deepseek-v4.1-flash-free`，所有 tier 的 effort/variant 固定 `max`。
 `--pin opencode` 仅等待 OpenCode 空位，不 spill；`--pin codex|cc` 保持既有双池逻辑。
-未 pin 的 L/M/H 级任务统一按 Codex/CC 亲和度选池，恢复 `1bf01af` 前的自动选池行为。
-低风险和 research + read_only 任务同样遵守双池规则；双池满或 spill 分数不足时留 queue。
-OpenCode 仅通过 `--pin opencode` 选择，Codex/CC 的副池永远不包含 OpenCode。
+未 pin 的 L 级低风险任务有 OpenCode 空位时优先进入该池；池满则回到原 Codex/CC 选池。
+其余任务不进入 OpenCode，Codex/CC 的副池永远不包含 OpenCode。
+
+低风险 = `area=research AND read_only`，或同时满足 files ≤3、无 shared_files、risk≠high、
+无高风险文件。文件按仓库相对路径归一化（支持绝对路径、子目录 cwd 和 `..`）；
+高风险前缀为 `lib/core.py`、`lib/affinity.py`、`bin/`、`launchd/`，覆盖这些路径的目录锁也不走低风险通道。
+research + read_only 是独立豁免。非 Git 路径按 cwd 相对路径检查。
 
 原 `pick_pool` 保持双池：亲和分 → 主池有空位就放；否则副池分 ≥45 才 spill；否则留 queue。
 锁仍阻止任何池启动。OpenCode 免费模型跳过 quota 门禁（缺失、null、0 均不阻塞）；

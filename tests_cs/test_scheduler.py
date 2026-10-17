@@ -230,24 +230,18 @@ class SchedulerTests(unittest.TestCase):
         open_full = [dict(id="open-%s" % i, pool="opencode", files=[]) for i in range(2)]
         paid_full = [dict(id="%s-%s" % (p, i), pool=p, files=[])
                      for p in ("codex", "cc") for i in range(2)]
-        cases = [({}, [], "codex"), ({}, open_full, "codex"),
-                 ({}, paid_full, None),
+        cases = [({}, [], "opencode"), ({}, open_full, "codex"),
                  ({"pin": "opencode", "tier": "H"}, [], "opencode"),
                  ({"pin": "opencode"}, open_full, None),
                  ({"pin": "codex"}, [], "codex"), ({"pin": "cc"}, [], "cc"),
                  ({"pin": "codex"}, paid_full, None), ({"pin": "cc"}, paid_full, None),
-                 ({"tier": "M"}, [], "codex"), ({"tier": "M"}, paid_full, None),
-                 ({"tier": "H"}, [], "codex"), ({"tier": "H"}, paid_full, None),
-                 ({"area": "frontend", "tier": "L"}, [], "cc"),
-                 ({"area": "frontend", "tier": "M"}, [], "cc"),
-                 ({"area": "frontend", "tier": "H"}, [], "cc"),
-                 ({"area": "research", "read_only": True, "files": []}, [], "cc"),
+                 ({"tier": "M"}, [], "codex"), ({"tier": "H"}, paid_full, None),
                  ({"risk": "high"}, [], "codex"),
                  ({"shared_files": ["src/shared.py"]}, [], "codex"),
                  ({"files": ["a", "b", "c", "d"]}, [], "codex"),
-                 ({"files": ["a", "b", "c"]}, [], "codex"),
+                 ({"files": ["a", "b", "c"]}, [], "opencode"),
                  ({"area": "research", "read_only": True, "risk": "high",
-                   "files": ["lib/core.py"], "shared_files": ["shared"]}, [], "codex")]
+                   "files": ["lib/core.py"], "shared_files": ["shared"]}, [], "opencode")]
         for changes, running, expected in cases:
             job = dict(base, **changes)
             with self.subTest(changes=changes, pools=[j["pool"] for j in running]):
@@ -261,7 +255,7 @@ class SchedulerTests(unittest.TestCase):
                          affinity.score(base, {}, {}))
         blocker = dict(id="locked", cwd=str(self.cwd), files=["src/a.py"], pool="cc")
         job = dict(base)
-        self.assertEqual(core.check_queue(self.root, job, [blocker]), "codex")
+        self.assertEqual(core.check_queue(self.root, job, [blocker]), "opencode")
         self.assertEqual([r["type"] for r in job["queue_reasons"]], ["lock"])
 
     def test_opencode_high_risk_paths_normalized_relative_to_repo(self):
@@ -297,17 +291,12 @@ class SchedulerTests(unittest.TestCase):
                 self.assertEqual(job["effort"], "max")
 
     def test_opencode_model_validation_at_submit_and_launch(self):
-        for flags in (("--pin", "opencode"),):
+        for flags in (("--pin", "opencode"), ("--tier", "L")):
             result = self.submit("bad-model", "--prompt-text", "fixture", "--model", "other/model",
                                  *flags, expected=2)
             self.assertIn("opencode/", result["error"])
             self.assertIsNone(core.find_job(self.root, "bad-model"))
             self.assertFalse((self.root / "queue/bad-model.prompt.md").exists())
-        self.submit("unpinned-model", "--tier", "L", "--prompt-text", "fixture",
-                    "--model", "other/model", "--tick")
-        unpinned = core.find_job(self.root, "unpinned-model")
-        self.assertEqual(unpinned["pool"], "cc")
-        self.assertEqual(unpinned["model"], "other/model")
         job = self.record(model="gpt-6.1-sol")
         with patch.object(core, "remote_dir") as remote:
             with self.assertRaisesRegex(ValueError, "opencode/"):

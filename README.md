@@ -104,10 +104,11 @@ Codex/CC/OpenCode 并发上限默认 24/6/32，运行时读取 `{CS_HOME}/caps.j
 其次环境变量 `CS_CODEX_CAP` / `CS_CC_CAP` / `CS_OPENCODE_CAP`，最后用默认值。tick、status、board、dashboard `/api/state`
 每次重读，改 caps.json 无需改代码。该文件是运行时状态，不提交。
 
-## OpenCode 显式选池
+## OpenCode L 级路由
 
-未 pin 的 L/M/H 级任务统一按 Codex/CC 亲和度选池，包括低风险和 research + read-only 任务。
-双池满或 spill 分数不足时留 queue，不自动进入 OpenCode。
+未 pin 的 L 级低风险任务优先走 `opencode`，池满回退原 Codex/CC 亲和选池。
+低风险为 research + read-only，或 files ≤3、无 shared_files、risk≠high 且无高风险路径；
+仓库相对路径前缀 `lib/core.py`、`lib/affinity.py`、`bin/`、`launchd/` 为高风险。
 `--pin opencode` 只等待此池，`--pin codex|cc` 保持旧逻辑；OpenCode 不参与 spill。
 默认模型 `opencode/deepseek-v4.1-flash-free`，variant 固定 `max`；此池免费，豁免 quota.json 门禁。
 JSONL text parts 提取为外部 conclusion.md，原始事件留在 worker 的 output.jsonl / log。

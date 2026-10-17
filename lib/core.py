@@ -625,6 +625,8 @@ def launch(root, job, pool):
                 "; mv " + q(str(exit_file) + ".tmp") + " " + q(str(exit_file)))
         run_sh.write_text("#!/bin/bash\nset -euo pipefail\n" +
                           "trap " + q(trap) + " EXIT\n" +
+                          # Workers inherit CS_JOB_ID so nested agents can detect cs jobs.
+                          "export CS_JOB_ID=" + q(job["id"]) + "\n" +
                           "cd " + q(cwd) + "\n" + command + "\n")
         with log.open("w") as output:
             proc = subprocess.Popen(["bash", str(run_sh)], stdout=output,

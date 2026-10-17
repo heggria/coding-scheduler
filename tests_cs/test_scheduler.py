@@ -32,6 +32,7 @@ class SchedulerTests(unittest.TestCase):
         self.cwd = self.base / "work"
         self.cwd.mkdir()
         self.env = patch.dict(os.environ, {"CS_HOME": str(self.root), "CS_TEST_FAKE_WORKER": "1"})
+        os.environ.pop("CS_JOB_ID", None)
         self.env.start()
         self.addCleanup(self.env.stop)
         core.ensure()
@@ -309,6 +310,16 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(core.find_job(self.root, "custom-open")["model"], "opencode/custom")
         self.assertEqual(core.find_job(self.root, "custom-open")["effort"], "max")
 
+    def test_nested_submit_refused_unless_allowed(self):
+        with patch.dict(os.environ, {"CS_JOB_ID": "parent-job"}):
+            out = self.cli("submit", "--project", "fixture", "--area", "research", "--tier", "M",
+                           "--cwd", str(self.cwd), "--id", "nested", "--read-only", "--json",
+                           "--prompt-text", "x", expected=2)
+            self.assertIn("nested submit", out)
+            self.assertIsNone(core.find_job(self.root, "nested"))
+            self.submit("nested-ok", "--allow-nested", "--prompt-text", "x")
+        self.assertIsNotNone(core.find_job(self.root, "nested-ok"))
+
     def test_opencode_shell_jsonl_flags_prompt_and_exit(self):
         self.submit("open-shell", "--pin", "opencode", "--prompt-text", "goal with 'quotes'\nnext")
         job = core.find_job(self.root, "open-shell")
@@ -325,6 +336,7 @@ class SchedulerTests(unittest.TestCase):
         script = worker / "run.sh"
         self.assertIn("opencode run -m", script.read_text())
         self.assertIn("#max' --auto --format json", script.read_text())
+        self.assertIn("export CS_JOB_ID=open-shell\n", script.read_text())
         fake_bin = self.base / "fake-opencode"
         fake_bin.mkdir()
         executable = fake_bin / "opencode"

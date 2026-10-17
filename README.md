@@ -232,3 +232,7 @@ OpenCode 池始终豁免。存在快照时阻止选中的 Codex/CC 池在额度�
 执行 submit → tick → wait → status → board。它检查新任务状态和产物均写入临时 CS_HOME，
 并保留 JSON 证据；源目录可由生产 launchd 并发更新，不比较源目录指纹。
 假 worker 同步生成 log/conclusion/exit，拒绝默认生产状态根，不执行真实 codex/claude/opencode。
+
+## 嵌套保护
+
+worker 的 run.sh 导出 `CS_JOB_ID=<job id>`。设置了该变量时 `cs submit` / `cs retry` 默认拒绝（exit 2），需显式 `--allow-nested`。

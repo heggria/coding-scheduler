@@ -57,6 +57,9 @@ def line_count(value):
 
 
 def cmd_submit(args):
+    if os.environ.get("CS_JOB_ID") and not getattr(args, "allow_nested", False):
+        return error(args, "refusing nested submit inside cs job %s; do the task directly "
+                     "or pass --allow-nested" % os.environ["CS_JOB_ID"])
     core.validate_model(args.pin, args.model)
     files = [f.strip() for f in args.files.split(",") if f.strip()]
     shared_files = [f.strip() for f in args.lock_shared.split(",") if f.strip()]
@@ -164,7 +167,8 @@ def cmd_retry(args):
         prompt_text=original["user_prompt"], prompt=None, no_template=original.get("no_template", False),
         scope_policy=args.scope_policy or original.get("scope_policy", "strict"),
         id=None, review_of=original.get("review_of"), retry_of=original["id"],
-        idempotency_key=args.idempotency_key, tick=args.tick, json=args.json)
+        idempotency_key=args.idempotency_key, tick=args.tick, json=args.json,
+        allow_nested=args.allow_nested)
     return cmd_submit(submit_args)
 
 
@@ -318,6 +322,7 @@ def main():
     s.add_argument("--project", required=True, type=identifier)
     s.add_argument("--area", required=True, choices=["backend", "protocol", "frontend", "ui-copy", "test", "review", "ops-script", "research"])
     s.add_argument("--tier", required=True, choices=["L", "M", "H"])
+    s.add_argument("--allow-nested", action="store_true", help="allow submit from inside a cs job (CS_JOB_ID set)")
     s.add_argument("--cwd", required=True)
     prompt = s.add_mutually_exclusive_group(required=True)
     prompt.add_argument("--prompt", help="prompt file, or - for stdin")
@@ -341,6 +346,7 @@ def main():
     r.add_argument("--add-files", default="")
     r.add_argument("--add-shared", default="")
     r.add_argument("--use-need-files", action="store_true")
+    r.add_argument("--allow-nested", action="store_true", help="allow retry from inside a cs job")
     r.add_argument("--scope-policy", choices=["strict", "companion", "flex"], default=None)
     r.add_argument("--idempotency-key", default=None)
     r.add_argument("--tick", action="store_true")

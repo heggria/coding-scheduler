@@ -16,8 +16,8 @@ from pathlib import Path
 LIB = Path(__file__).resolve().parents[1] / "lib"
 sys.path.insert(0, str(LIB))
 
-from locks import directory_locks, lock_context
-from scope import narrow_warnings, policy_text
+from locks import directory_locks, file_conflict, lock_context
+from scope import narrow_warnings
 import core
 from core import (TZ, check_queue, counts, doctor_checks, ensure, find_job, home,
                   job_summary, kill_worker_group, load_jobs, reason_text, reclaim, remove_job,
@@ -83,23 +83,7 @@ def cmd_submit(args):
     else:
         body = Path(args.prompt).expanduser().read_text()
     user_prompt = body
-    protected = core.protected_scope_paths({"id": jid, "cwd": str(cwd)}, load_jobs(root, "running"))
-    declaration = "\n".join([
-        '## 本单声明',
-        '- cwd: ' + str(cwd),
-        '- 可写文件清单 (files): ' + (json.dumps(files, ensure_ascii=False) if files else '无'),
-        '- shared 锁文件 (shared_files): ' + (json.dumps(shared_files, ensure_ascii=False) if shared_files else '无'),
-        '- area: ' + args.area,
-        '- read-only: ' + ('是' if args.read_only else '否'),
-        '',
-        policy_text(args.scope_policy, protected),
-    ])
-    body = declaration + "\n\n" + body
-    template = root / "projects" / (args.project + ".md")
-    if not args.no_template and template.is_file():
-        body = template.read_text().rstrip() + "\n\n" + body
     prompt_dst = root / "queue" / (jid + ".prompt.md")
-    prompt_dst.write_text(body)
     job = {
         "id": jid, "project": args.project, "area": args.area, "tier": args.tier,
         "pin": args.pin, "risk": args.risk,
@@ -119,7 +103,14 @@ def cmd_submit(args):
         job["retry_of"] = args.retry_of
     if args.review_of:
         job["review_of"] = args.review_of
+    prompt_dst.write_text(core.submission_prompt(root, job))
     job["lock_ctx"] = lock_context(job)
+    others = load_jobs(root, "running") + load_jobs(root, "queue")
+    # Warn only about existing shared locks, using the scheduler's repo/path rules.
+    shared_jobs = [dict(other, files=[], lock_ctx=None) for other in others if other.get("shared_files")]
+    for conflict in file_conflict(job, shared_jobs):
+        job["warnings"].append("shared lock overlap with %s: %s / %s; serialize these jobs" %
+                               (conflict["job"], conflict["mine"], conflict["theirs"]))
     for path in directory_locks(job["lock_ctx"]):
         print("WARNING: directory lock %r covers all descendant paths" % path, file=sys.stderr)
     for warning in job["warnings"]:

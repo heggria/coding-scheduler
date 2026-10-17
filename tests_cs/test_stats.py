@@ -123,6 +123,36 @@ class StatsTests(unittest.TestCase):
             core.log_event(self.root, self.job("last"))
         self.assertEqual(len(list((self.root / "logs").glob("events.jsonl*"))), 1)
 
+    def test_expanded_blocked_classes_and_ordering(self):
+        cases = {
+            "files_narrow": ["需追加授权", "需额外授权", "需新增授权", "未获写授权",
+                             "缺少必要文件授权", "不在白名单", "outside the allowed scope",
+                             "outside the writable scope", "NEED_FILES: lib/extra.py"],
+            "pre_existing_main_failure": ["also reproduced on origin/main", "main 上同样失败",
+                                         "pre-existing failure", "已在 main 失败"],
+            "upstream_transient": ["Transport channel closed", "API Error: 503",
+                                   "model is at capacity", "connection reset"],
+        }
+        events = []
+        for kind, texts in cases.items():
+            for text in texts:
+                with self.subTest(text=text):
+                    self.assertEqual(blocked_class(self.job(status="blocked"), text), kind)
+                    self.assertIsNone(blocked_class(self.job(status="failed"), text))
+                events.append(dict(status="blocked", blocked_reason_class=kind))
+        classes = aggregate(events)["blocked_reason_classes"]
+        self.assertEqual(list(classes), ["files_narrow", "read_only_write", "pre_existing_main_failure",
+                                         "upstream_transient", "soft_block", "bad_input", "other"])
+        for kind, texts in cases.items():
+            self.assertEqual(classes[kind], len(texts))
+
+    def test_event_uses_last_queue_observation(self):
+        reasons = [{"type": "lock"}, {"type": "pool_full"}, {"type": "lock"}]
+        event = job_event(self.job(last_queue_reasons=reasons, queue_reasons=[], queue_wait_s=12.5))
+        self.assertEqual(event["queue_reason_types"], ["lock", "pool_full"])
+        self.assertEqual(event["last_queue_reasons"], reasons)
+        self.assertEqual(event["queue_wait_s"], 12.5)
+
 
 if __name__ == "__main__":
     unittest.main()

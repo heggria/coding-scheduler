@@ -5,10 +5,11 @@
 ## 待办
 2. worktree 能力：submit 时可选 `--worktree`，cs 自动给每单开独立 git worktree（分支名=job id），跑完保留供合并；文件锁只用于明确改同一段核心代码的几单。
 3. 文件锁收窄：拒绝/告警整目录锁（如 `tests/`），要求写到具体文件。
-4. 失败自动续跑（之前 wave1 未做）。
+4. 更广泛的失败续跑策略（仅上游瞬态错误单次自动重试已完成；不自动重试业务失败或 BLOCKED）。
 5. 生产状态根目录约 142 个续跑 / bak / tgz 文件需清理（本次不删除）。
 
 ## 已完成
+- Reliability：OpenCode 静默超时/本地错误归因、已交付 BLOCKED 保留原状态及 warning、授权/base-main/上游瞬态受阻分类、worker 已有失败交付指引、上游瞬态一次重排、排队原因/等待时长终态留存、提交共享锁重叠警告。仅本地实现与隔离验证；合并、部署另行授权。
 - Observability：终态 JSONL 事件（轮转）、`cs stats`（默认近 2h、过滤、分组、耗时/prompt 均值、旧记录只读补齐）、只读 `/api/stats` 与 Command Center 近 2h 成功率/受阻/取消/耗时/三池面板。结果判定保持原语义；实现、隔离验证、合并及 dashboard 部署证据分别见任务外部 conclusion。
 - OpenCode 第三池：L 级低风险优先、满池回退原双池；显式 pin 不外溢，Codex/CC 不向 OpenCode spill。Deepseek 订阅模型默认、variant=max、quota 豁免、caps 默认 32、doctor/CLI/dashboard 三池支持。实现与隔离测试交付；真实模型验收未执行，部署以任务结论为准。
 - wave1：status 回收僵尸、exit0 但无结论→unknown（已修正早期 blocked 规则）、doctor 预检、cancel --superseded-by。

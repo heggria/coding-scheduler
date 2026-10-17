@@ -64,6 +64,9 @@ cs board --json
   区分大小写精确匹配，不接受 Markdown 包装、尾随原因、正文提及或 FAIL。
   其余记 done，适用于编码、research 和 read-only 单；成功结论应写 `STATUS: DONE`。
   自然语言“未合并/只读/未提交”等不参与判定；其他非零退出（除 124）记 failed。
+- 交付例外：exit=0 的 BLOCKED 结论若含 PR URL、已创建/draft 的 PR #编号，或提交/推送/HEAD
+  附近的完整 40 位 SHA，记 done，并保留 `raw_status=blocked` 和 `delivered_but_blocked` warning。
+  仅在“未改代码/未提交/未开 PR”等否定说明后报告 HEAD，不算交付。
 - doctor 的非 Git、DNS、信任提示及与所选池无关的 CLI 检查失败为 WARN；
   `--pool codex|cc|opencode` 指定的 CLI 缺失、cwd 无效、Git 元数据不可写仍为 FAIL。
   `claude_trusted_dir_hint` 仅检查 `.claude.json` 中 cwd 的准确项目路径及
@@ -107,8 +110,19 @@ cs retry <id> --add-shared shared/core.py --idempotency-key retry-123 --json
 
 retry 只接受终态单，创建新 ID 并保存 `retry_of`；克隆项目、area/tier/cwd/risk/pin/model/read_only、
 文件与共享锁、模板开关、范围策略及原始用户目标，重新生成声明。新增 files 不会自动升级共享锁；
-原单不变。未给 `--tick` 只排队，不会自动重试。新增单保存 `user_prompt`，旧单缺少原始目标时
+原单不变。未给 `--tick` 只排队。新增单保存 `user_prompt`，旧单缺少原始目标时
 retry 明确拒绝，需手工重新 submit；旧单无策略按 strict 继承。
+
+回收 failed 单时，Codex transport 断开、模型 capacity、HTTP 502/503/504、API Error 50x、
+Bad Gateway/Service Unavailable/connection reset 会触发一次自动排队，保存
+`failure_reason=upstream_transient`、原单 `retried_as` 和新单 `retry_of`；由 tick 调度（可同轮启动）。
+已有 retry_of 的单不再自动重试；done/blocked/cancelled/unknown 和非瞬态错误不重试。
+重建声明沿用显式 retry 的提交字段和当前模板；旧单可复用保存的完整 prompt，缺失时记录 retry_error。
+worker prompt 要求在 base/main 复跑确认已有失败，结论列 `Pre-existing failures`，继续交付。
+
+启动时保存最后一次非空排队原因为 `last_queue_reasons` 及 `queue_wait_s`；终态事件保留这些字段，
+`queue_reason_types` 从留存原因提取。submit 的 files/lock-shared 命中已有 running/queued 单的
+shared_files 时，stderr 和 JSON warnings 列出任务 ID、路径并建议串行，不拒绝提交。
 
 回收保存 `changed_files` 和 `scope`（declared/companion/out_of_scope/shared_violations），
 共享保护集合来自结束时同仓库其他仍运行任务。只观测、不改结果状态；flex 的 out_of_scope
@@ -163,6 +177,10 @@ Codex/CC/OpenCode 并发上限默认 24/6/32，运行时读取 `{CS_HOME}/caps.j
 `--pin opencode` 只等待此池，`--pin codex|cc` 保持旧逻辑；OpenCode 不参与 spill。
 默认模型 `opencode-go/deepseek-v4.1-flash`，variant 固定 `max`（2.x CLI 以 `model#max` 传入）；此池为订阅，豁免 quota.json 门禁。
 JSONL text parts 提取为外部 conclusion.md，原始事件留在 worker 的 output.jsonl / log。
+reclaim/tick 检查 OpenCode 的 log 与 output.jsonl 的 mtime/size；从启动或最后变化起静默
+600 秒即清理进程组并记 failed / `no_output_timeout`，可用正数 `CS_OPENCODE_IDLE_S` 调整。
+非零退出或超时会扫描任务本地结论与两份日志尾部，记录 rate_limit、insufficient_funds、
+model_unavailable、auth 等 failure_reason 和简短 failure_detail；exit=124 仍为 unknown。
 
 可选真实冒烟命令（不属于自动测试；显式执行才调用真实模型）：
 

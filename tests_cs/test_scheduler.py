@@ -433,7 +433,7 @@ class SchedulerTests(unittest.TestCase):
                 self.assertIn("overrides generic strict wording", prompt)
             shared = self.submit(policy + "-shared", "--area", "backend", "--files", "review.md",
                                  "--lock-shared", "a.py,b.py,c.py,d.py", "--prompt-text", "goal", *flags)
-            self.assertEqual(len(shared["warnings"]), 1)
+            self.assertEqual(len(shared["warnings"]), 1 + 4 * ("companion", "strict", "flex").index(policy))
             self.assertIn("serialize sibling jobs on the same repo", shared["warnings"][0])
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()), \
@@ -704,6 +704,289 @@ class SchedulerTests(unittest.TestCase):
         conclusion.unlink()
         self.assertEqual(core.classify_outcome(0, conclusion), ("unknown", None))
         self.assertEqual(core.classify_outcome(0, None), ("unknown", None))
+
+    def test_delivered_blocked_keeps_raw_status_and_warning(self):
+        sha = "f7fd" + "a" * 36
+        bodies = ["Implementation complete: Draft PR #249 SHA: " + sha,
+                  "Created PR #249", "PR #249 已创建", "Pushed commit " + sha,
+                  "已推送 commit " + sha, "HEAD: " + sha, "Pushed commit:\n" + sha,
+                  "Delivered https://github.com/example/repo/pull/249",
+                  "Delivered https://example.invalid/repo/pulls/249"]
+        for index, body in enumerate(bodies):
+            jid = "delivered-%s" % index
+            self.submit(jid, "--prompt-text", "deliver", "--tick")
+            worker = core.remote_dir(jid)
+            (worker / "conclusion.md").write_text(body + "\nSTATUS: BLOCKED\nCI pending")
+            core.reclaim(self.root)
+            job = core.find_job(self.root, jid)
+            with self.subTest(body=body):
+                self.assertEqual(job["status"], "done")
+                self.assertEqual(job["raw_status"], "blocked")
+                self.assertIn("delivered_but_blocked: CI pending", job["warnings"])
+                summary = core.job_summary(job)
+                self.assertEqual(summary["raw_status"], "blocked")
+                self.assertEqual(summary["warnings"], job["warnings"])
+
+    def test_blocked_without_delivery_and_exit_precedence(self):
+        sha = "2dc5" + "b" * 36
+        result = self.base / "result.txt"
+        for body in ("未改代码、未开 PR。HEAD：" + sha,
+                     "no code changes\nHEAD: " + sha,
+                     "未提交\ncommit " + sha,
+                     "未开 PR https://github.com/example/repo/pull/249",
+                     "not pushed commit " + sha, "Will create PR #249",
+                     "PR #249 exists", "No PR #249 created", "pushed commit f7fd1234"):
+            result.write_text("STATUS: BLOCKED\n" + body)
+            job = {}
+            with self.subTest(body=body):
+                self.assertEqual(core.classify_outcome(0, result, job)[0], "blocked")
+                self.assertNotIn("raw_status", job)
+        result.write_text("STATUS: BLOCKED\nDraft PR #249")
+        for code, expected in ((1, "failed"), (124, "unknown"), (None, "unknown")):
+            self.assertEqual(core.classify_outcome(code, result)[0], expected)
+
+    def test_opencode_idle_reclaim_kills_group_and_preserves_timeout_reason(self):
+        for index, text in enumerate((None, "Insufficient account funds")):
+            jid = "idle-%s" % index
+            self.record(jid, "running", pool="opencode", pid=os.getpid(), pgid=12345,
+                        started_at=core.datetime.fromtimestamp(100, core.TZ).isoformat())
+            worker = core.remote_dir(jid)
+            worker.mkdir(parents=True)
+            if text:
+                (worker / "output.jsonl").write_text(json.dumps({"type": "error", "error": text}))
+                os.utime(worker / "output.jsonl", (100, 100))
+            with patch.object(core.time, "time", return_value=700), \
+                    patch.object(core, "kill_worker_group", return_value={"cancel_signal": "SIGTERM"}) as kill:
+                self.assertEqual(core.reclaim(self.root), 1)
+                kill.assert_called_once_with(12345)
+            job = core.find_job(self.root, jid)
+            self.assertEqual(job["status"], "failed")
+            self.assertEqual(job["exit"], 1)
+            self.assertEqual(job["failure_reason"], "no_output_timeout")
+            self.assertTrue(job["failure_detail"])
+            self.assertNotIn("retried_as", job)
+
+    def test_opencode_idle_tracks_both_files_mtime_size_and_config(self):
+        worker = core.remote_dir("activity")
+        worker.mkdir(parents=True)
+        for filename in ("log", "output.jsonl"):
+            job = dict(id="activity", started_at=core.datetime.fromtimestamp(100, core.TZ).isoformat())
+            self.assertFalse(core.opencode_idle(job, 699))
+            path = worker / filename
+            path.write_text("text")
+            os.utime(path, (700, 700))
+            self.assertFalse(core.opencode_idle(job, 700))
+            self.assertFalse(core.opencode_idle(job, 1299))
+            self.assertTrue(core.opencode_idle(job, 1300))
+            # Same size with new mtime, then size change with unchanged mtime.
+            os.utime(path, (1300, 1300))
+            self.assertFalse(core.opencode_idle(job, 1300))
+            path.write_text("longer text")
+            os.utime(path, (1300, 1300))
+            self.assertFalse(core.opencode_idle(job, 1400))
+            path.unlink()
+            self.assertFalse(core.opencode_idle(job, 1500))
+        for value in ("bad", "0", "-1", "nan", "inf"):
+            with patch.dict(os.environ, {"CS_OPENCODE_IDLE_S": value}):
+                self.assertFalse(core.opencode_idle(job, 2099))
+                self.assertTrue(core.opencode_idle(job, 2100))
+        with patch.dict(os.environ, {"CS_OPENCODE_IDLE_S": "10"}):
+            self.assertFalse(core.opencode_idle(job, 1509))
+            self.assertTrue(core.opencode_idle(job, 1510))
+        # A delayed tick must use the write time, not grant another full idle window.
+        path.write_text("delayed write")
+        os.utime(path, (1600, 1600))
+        self.assertTrue(core.opencode_idle(job, 2200))
+
+    def test_idle_guard_only_running_opencode_without_exit(self):
+        self.record("codex-live", "running", pool="codex", pid=os.getpid())
+        self.record("open-exit", "running", pool="opencode", pid=os.getpid())
+        worker = core.remote_dir("open-exit")
+        worker.mkdir(parents=True)
+        (worker / "exit").write_text("124")
+        with patch.object(core, "opencode_idle") as idle, patch.object(core, "kill_worker_group") as kill:
+            self.assertEqual(core.reclaim(self.root), 1)
+            idle.assert_not_called()
+            kill.assert_not_called()
+        self.assertEqual(core.find_job(self.root, "open-exit")["status"], "unknown")
+
+    def test_opencode_known_plain_and_json_errors(self):
+        cases = [("HTTP 429", "rate_limit"), ("rate limit exceeded", "rate_limit"),
+                 ("Insufficient account funds", "insufficient_funds"),
+                 ("Model unavailable", "model_unavailable"), ("provider.no-route", "model_unavailable"),
+                 ("authentication failed", "auth"), ("Unauthorized 401", "auth"),
+                 ("invalid API key", "auth"), ("auth error", "auth"), ("ProviderAuthError", "auth")]
+        for index, (text, expected) in enumerate(cases):
+            for filename in ("log", "output.jsonl"):
+                jid = "error-%s-%s" % (index, filename)
+                self.record(jid, "running", pool="opencode")
+                worker = core.remote_dir(jid)
+                worker.mkdir(parents=True)
+                (worker / "exit").write_text("124" if index == 0 else "7")
+                (worker / filename).write_text(text if filename == "log" else
+                                              json.dumps({"type": "error", "error": {"message": text}}))
+                core.reclaim(self.root)
+                job = core.find_job(self.root, jid)
+                with self.subTest(text=text, filename=filename):
+                    self.assertEqual(job["failure_reason"], expected)
+                    self.assertIn(text, job["failure_detail"])
+                    self.assertEqual(job["status"], "unknown" if index == 0 else "failed")
+                    self.assertNotIn("retried_as", job)
+        self.assertEqual(core.opencode_failure('{"type": "error", "message": "unexpected"}')[0],
+                         "opencode_error")
+        self.assertEqual(core.opencode_failure("unrecognized failure"), (None, None))
+        self.assertEqual(core.opencode_failure("authentication succeeded; unit tests failed"), (None, None))
+
+    def test_opencode_persistent_error_takes_precedence_over_old_transient(self):
+        self.submit("funds", "--pin", "opencode", "--prompt-text", "goal", "--tick")
+        worker = core.remote_dir("funds")
+        (worker / "exit").write_text("1")
+        (worker / "log").write_text("Service Unavailable\nInsufficient account funds")
+        core.reclaim(self.root)
+        job = core.find_job(self.root, "funds")
+        self.assertEqual(job["failure_reason"], "insufficient_funds")
+        self.assertNotIn("retried_as", job)
+        self.assertEqual(core.load_jobs(self.root, "queue"), [])
+
+    def test_upstream_transient_requeues_once_and_preserves_submission(self):
+        template = self.root / "projects/fixture.md"
+        template.write_text("original template")
+        self.submit("transient", "--area", "backend", "--files", "src/x.py", "--lock-shared", "core.py",
+                    "--scope-policy", "flex", "--pin", "codex", "--model", "custom-model",
+                    "--prompt-text", "raw goal", "--idempotency-key", "original-key", "--tick")
+        worker = core.remote_dir("transient")
+        (worker / "exit").write_text("1")
+        (worker / "log").write_text("Transport channel closed")
+        template.write_text("current template")
+        self.assertEqual(core.reclaim(self.root), 1)
+        original = core.find_job(self.root, "transient")
+        retry = core.find_job(self.root, original["retried_as"])
+        self.assertEqual(original["failure_reason"], "upstream_transient")
+        self.assertEqual(original["status"], "failed")
+        self.assertEqual(retry["status"], "queued")
+        self.assertEqual(retry["retry_of"], "transient")
+        for key in ("project", "area", "tier", "cwd", "files", "shared_files", "scope_policy",
+                    "pin", "requested_model", "read_only", "user_prompt", "no_template"):
+            self.assertEqual(retry[key], original[key], key)
+        self.assertIsNone(retry["idempotency_key"])
+        prompt = Path(retry["prompt_file"]).read_text()
+        self.assertTrue(prompt.startswith("current template"))
+        self.assertTrue(prompt.endswith("raw goal"))
+        self.assertEqual(prompt.count("## 本单声明"), 1)
+        core.reclaim(self.root)
+        self.assertEqual(len(core.load_jobs(self.root, "queue")), 1)
+        core.tick(self.root)
+        worker = core.remote_dir(retry["id"])
+        (worker / "exit").write_text("7")
+        (worker / "conclusion.md").write_text("API Error: 503 Service Unavailable")
+        core.reclaim(self.root)
+        retry = core.find_job(self.root, retry["id"])
+        self.assertEqual(retry["failure_reason"], "upstream_transient")
+        self.assertEqual(retry["status"], "failed")
+        self.assertNotIn("retried_as", retry)
+        self.assertEqual(core.load_jobs(self.root, "queue"), [])
+
+    def test_transient_matching_exit_gate_and_legacy_prompt(self):
+        errors = ["Transport channel closed", "error sending request for url (https://chatgpt.com/api)",
+                  "model is at capacity", "HTTP 502", "HTTP 503", "HTTP 504", "API Error: 500",
+                  "API Error: 502", "API Error: 503", "API Error: 504", "Bad Gateway",
+                  "Service Unavailable", "connection reset by peer"]
+        for index, text in enumerate(errors):
+            jid = "legacy-%s" % index
+            prompt = self.root / "queue" / (jid + ".prompt.md")
+            prompt.write_text("legacy exact prompt")
+            self.record(jid, "running", project="fixture", area="backend", tier="M",
+                        prompt_file=str(prompt), pool="codex")
+            worker = core.remote_dir(jid)
+            worker.mkdir(parents=True)
+            (worker / "exit").write_text("1")
+            (worker / "log").write_text(text)
+            core.reclaim(self.root)
+            original = core.find_job(self.root, jid)
+            self.assertEqual(original["failure_reason"], "upstream_transient", text)
+            retry = core.find_job(self.root, original["retried_as"])
+            self.assertEqual(Path(retry["prompt_file"]).read_text(), "legacy exact prompt")
+        count = len(core.load_jobs(self.root, "queue"))
+        for index, (code, text, status) in enumerate([
+                (0, "STATUS: BLOCKED\nBad Gateway", "blocked"),
+                (0, "STATUS: DONE\nBad Gateway", "done"),
+                (124, "Bad Gateway", "unknown"), (None, "Bad Gateway", "unknown"),
+                (2, "unit test assertion failed", "failed")]):
+            jid = "no-retry-%s" % index
+            self.record(jid, "running", pool="codex")
+            worker = core.remote_dir(jid)
+            worker.mkdir(parents=True)
+            if code is not None:
+                (worker / "exit").write_text(str(code))
+            (worker / "conclusion.md").write_text(text)
+            core.reclaim(self.root)
+            self.assertEqual(core.find_job(self.root, jid)["status"], status)
+            self.assertNotIn("retried_as", core.find_job(self.root, jid))
+        self.assertEqual(len(core.load_jobs(self.root, "queue")), count)
+        self.record("cancelled-transient", "done", status="cancelled", exit=1)
+        self.assertEqual(core.reclaim(self.root), 0)
+        self.assertEqual(len(core.load_jobs(self.root, "queue")), count)
+
+    def test_worker_prompt_base_failure_guidance_for_every_pool(self):
+        for pool in ("codex", "cc", "opencode"):
+            self.submit("guide-" + pool, "--prompt-text", "goal", "--pin", pool, "--no-template", "--tick")
+            prompt = (core.remote_dir("guide-" + pool) / "prompt.md").read_text()
+            self.assertIn("Verify by running the same checks on base", prompt)
+            self.assertIn("'Pre-existing failures'", prompt)
+            self.assertIn("and still deliver", prompt)
+
+    def test_legacy_transient_missing_prompt_still_finishes_with_explanation(self):
+        self.record("missing-prompt", "running", pool="codex", prompt_file=None)
+        worker = core.remote_dir("missing-prompt")
+        worker.mkdir(parents=True)
+        (worker / "exit").write_text("1")
+        (worker / "log").write_text("Transport channel closed")
+        self.assertEqual(core.reclaim(self.root), 1)
+        job = core.find_job(self.root, "missing-prompt")
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["failure_reason"], "upstream_transient")
+        self.assertIn("original prompt unavailable", job["retry_error"])
+        self.assertNotIn("retried_as", job)
+
+    def test_launch_preserves_last_queue_reasons_and_wait_in_done_and_event(self):
+        self.record("blocker", "running", pool="codex", pid=os.getpid(), shared_files=["src/x.py"])
+        self.submit("waiting", "--files", "src/x.py", "--prompt-text", "goal")
+        core.tick(self.root)
+        queued = core.find_job(self.root, "waiting")
+        reasons = queued["queue_reasons"]
+        self.assertEqual(reasons[0]["type"], "lock")
+        core.remove_job(self.root, "running", "blocker")
+        core.tick(self.root)
+        core.reclaim(self.root)
+        done = core.find_job(self.root, "waiting")
+        self.assertEqual(done["last_queue_reasons"], reasons)
+        self.assertEqual(done["queue_reasons"], [])
+        self.assertGreaterEqual(done["queue_wait_s"], 0)
+        event = json.loads((self.root / "logs/events.jsonl").read_text())
+        self.assertEqual(event["queue_reason_types"], ["lock"])
+        self.assertEqual(event["last_queue_reasons"], reasons)
+        self.assertEqual(event["queue_wait_s"], done["queue_wait_s"])
+
+    def test_submit_warns_for_queued_and_running_shared_overlaps(self):
+        self.record("active", "running", shared_files=["src"], pid=os.getpid())
+        self.record("pending", "queue", shared_files=["src/core.py"])
+        self.record("ordinary", "queue", files=["src/core.py"])
+        args = ["cs", "submit", "--project", "fixture", "--area", "backend", "--tier", "M",
+                "--cwd", str(self.cwd), "--id", "overlap", "--files", "src/core.py",
+                "--lock-shared", "src/other.py", "--prompt-text", "goal", "--json"]
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(sys, "argv", args), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(CLI["main"](), 0)
+        warnings = json.loads(out.getvalue())["warnings"]
+        for jid in ("active", "pending"):
+            self.assertIn("shared lock overlap with " + jid, err.getvalue())
+        self.assertIn("src/core.py", err.getvalue())
+        self.assertIn("src/other.py", err.getvalue())
+        self.assertIn("serialize", err.getvalue())
+        self.assertNotIn("ordinary", err.getvalue())
+        self.assertEqual(len(warnings), 3)
+        self.assertTrue(all(warning in err.getvalue() for warning in warnings))
+        self.assertEqual(core.find_job(self.root, "overlap")["status"], "queued")
 
     def test_dashboard_v2_conclusion_is_done(self):
         body = (REPO / "tests_cs/fixtures/cs-dashboard-v2.txt").read_text()

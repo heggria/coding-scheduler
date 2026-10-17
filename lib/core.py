@@ -11,6 +11,7 @@ import shutil
 import signal
 import sys
 import time
+import uuid
 from contextlib import contextmanager
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -19,7 +20,8 @@ from pathlib import Path
 import affinity
 from affinity import CC_CAP, CODEX_CAP, OPENCODE_CAP, model_for, pick_pool, score
 from locks import GitLockResolver, file_conflict, lock_context
-from scope import scope_report
+from scope import narrow_warnings, policy_text, scope_report
+from stats import conclusion_text, timestamp, upstream_transient
 
 TZ = timezone(timedelta(hours=8))
 NO_SUB = (
@@ -134,6 +136,59 @@ def find_job(root, jid):
     return None
 
 
+def submission_prompt(root, job):
+    """Rebuild declarations from submission fields, including for retries."""
+    protected = protected_scope_paths(job, load_jobs(root, "running"))
+    declaration = "\n".join([
+        '## 本单声明',
+        '- cwd: ' + job["cwd"],
+        '- 可写文件清单 (files): ' + (json.dumps(job["files"], ensure_ascii=False) if job["files"] else '无'),
+        '- shared 锁文件 (shared_files): ' + (json.dumps(job["shared_files"], ensure_ascii=False) if job["shared_files"] else '无'),
+        '- area: ' + job["area"],
+        '- read-only: ' + ('是' if job["read_only"] else '否'),
+        '', policy_text(job["scope_policy"], protected),
+    ])
+    body = declaration + "\n\n" + job["user_prompt"]
+    template = root / "projects" / (job["project"] + ".md")
+    if not job.get("no_template") and template.is_file():
+        body = template.read_text().rstrip() + "\n\n" + body
+    return body
+
+
+def retry_transient(root, original):
+    """Queue one fresh attempt; never inherit execution/terminal evidence."""
+    if original.get("retry_of"):
+        return None
+    legacy_prompt = None
+    if "user_prompt" not in original:
+        try:
+            legacy_prompt = Path(original["prompt_file"]).read_text()
+        except (KeyError, OSError, TypeError):
+            original["retry_error"] = "original prompt unavailable; submit a new job explicitly"
+            return None
+    fields = ("project", "area", "tier", "cwd", "risk", "pin", "read_only", "files",
+              "shared_files", "no_template", "user_prompt", "review_of")
+    job = {key: original[key] for key in fields if key in original}
+    job.setdefault("files", [])
+    job.setdefault("shared_files", [])
+    job.setdefault("read_only", False)
+    job.update(id=original["id"] + "-retry-" + uuid.uuid4().hex[:8], retry_of=original["id"],
+               created_at=datetime.now(TZ).isoformat(), status="queued", pool=None, pid=None,
+               conclusion=None, exit=None, idempotency_key=None, affinity={},
+               scope_policy=original.get("scope_policy", "strict"),
+               model=original.get("requested_model", original.get("model")))
+    job["requested_model"] = job["model"]
+    job["warnings"] = narrow_warnings(job["files"], job["scope_policy"], job["shared_files"])
+    prompt = root / "queue" / (job["id"] + ".prompt.md")
+    prompt.write_text(legacy_prompt if legacy_prompt is not None else submission_prompt(root, job))
+    job["prompt_file"] = str(prompt)
+    job["lock_ctx"] = lock_context(job)
+    check_queue(root, job, [j for j in load_jobs(root, "running") if j["id"] != original["id"]])
+    job["queue_reasons"].append({"type": "awaiting_tick"})
+    write_job(root, "queue", job)
+    return job["id"]
+
+
 def git_output(cwd, *args):
     try:
         proc = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True,
@@ -240,7 +295,8 @@ def job_summary(job, lines=20):
               "queue_reasons": job.get("queue_reasons", []),
               "last_checked": job.get("last_checked")}
     for field in ("pgid", "cancel_killed_pids", "cancel_signal", "scope_policy", "scope",
-                  "changed_files", "need_files", "retry_of"):
+                  "changed_files", "need_files", "retry_of", "retried_as", "raw_status", "warnings",
+                  "failure_reason", "failure_detail", "retry_error", "last_queue_reasons", "queue_wait_s"):
         if field in job:
             result[field] = job[field]
     if job.get("outcome_reason"):
@@ -258,7 +314,7 @@ def job_summary(job, lines=20):
 
 
 def classify_outcome(exit_code, conclusion_path, job=None):
-    """Exit evidence takes precedence; only a whole-line STATUS: BLOCKED blocks."""
+    """Exit evidence takes precedence; preserve a delivered BLOCKED as a warning."""
     if exit_code is None or exit_code == 124:
         return "unknown", None
     if exit_code != 0:
@@ -270,8 +326,96 @@ def classify_outcome(exit_code, conclusion_path, job=None):
     if not text.strip():
         return "unknown", None
     if any(line.strip() == "STATUS: BLOCKED" for line in text.splitlines()):
+        if delivered(text):
+            if job is not None:
+                job["raw_status"] = "blocked"
+                lines = [line.strip() for line in text.splitlines() if line.strip()]
+                marker = lines.index("STATUS: BLOCKED")
+                reason = next((line for line in lines[marker + 1:] if not line.startswith("STATUS:")),
+                              next((line for line in lines if not line.startswith("STATUS:")), "STATUS: BLOCKED"))
+                warning = "delivered_but_blocked: " + reason[:240]
+                job["warnings"] = list(dict.fromkeys((job.get("warnings") or []) + [warning]))
+            return "done", None
         return "blocked", ["STATUS: BLOCKED"]
     return "done", None
+
+
+def delivered(text):
+    negative = (r"no code changes|no commits?|\bno\s+(?:draft\s+)?pr\b|not (?:created|pushed|committed)|"
+                r"(?:did not|have not|haven't|could not|couldn't) (?:push|commit|create|open)|"
+                r"未改代码|未提交|未推送|未开\s*pr|未创建\s*pr")
+    has_negative = re.search(negative, text, re.I)
+    for line in re.split(r"[\n；;。]", text):
+        if re.search(negative, line, re.I):
+            continue
+        if re.search(r"https?://[^\s<>]+/pulls?/\d+\b", line, re.I):
+            return True
+        if re.search(r"\bpr\s*#\d+\b", line, re.I) and re.search(r"created|draft|已开|创建", line, re.I):
+            return True
+    for sha in re.finditer(r"\b[0-9a-f]{40}\b", text, re.I):
+        nearby = text[max(0, sha.start() - 100):sha.end() + 100]
+        if re.search(negative, nearby, re.I):
+            continue
+        if re.search(r"pushed|推送", nearby, re.I):
+            return True
+        if not has_negative and re.search(r"\b(?:head|commit)\b", nearby, re.I):
+            return True
+    return False
+
+
+def opencode_idle(job, now):
+    """Persist both files' mtime/size, including same-size rewrites and deletion."""
+    jd = remote_dir(job["id"])
+    signature, mtimes = [], []
+    for path in (Path(job.get("log") or jd / "log"), jd / "output.jsonl"):
+        try:
+            stat = path.stat()
+            signature.append([stat.st_mtime_ns, stat.st_size])
+            mtimes.append(stat.st_mtime)
+        except OSError:
+            signature.append(None)
+    start = timestamp(job.get("started_at"))
+    last = job.get("output_changed_at", max([start.timestamp() if start else now] + mtimes))
+    if "output_signature" in job and signature != job["output_signature"]:
+        changes = [current[0] / 1e9 if current and (previous is None or current[0] != previous[0]) else now
+                   for previous, current in zip(job["output_signature"], signature) if previous != current]
+        last = max([last] + changes)
+    job.update(output_signature=signature, output_changed_at=last)
+    try:
+        threshold = float(os.environ.get("CS_OPENCODE_IDLE_S", "600"))
+        if not math.isfinite(threshold) or threshold <= 0:
+            threshold = 600
+    except ValueError:
+        threshold = 600
+    return now - last >= threshold
+
+
+def failure_text(job):
+    """Bound log reads; conclusions and job-local JSON errors are sufficient."""
+    parts = [conclusion_text(job)]
+    jd = remote_dir(job["id"])
+    for path in (Path(job.get("log") or jd / "log"), jd / "output.jsonl"):
+        try:
+            with path.open("rb") as handle:
+                handle.seek(max(0, path.stat().st_size - 65536))
+                parts.append(handle.read(65536).decode("utf-8", errors="replace"))
+        except OSError:
+            pass
+    return "\n".join(parts)
+
+
+def opencode_failure(text):
+    for reason, pattern in (
+            ("insufficient_funds", r"insufficient account funds"),
+            ("model_unavailable", r"model unavailable|provider[./]no-route"),
+            ("auth", r"\b(?:401|403|unauthorized|forbidden)\b|not authenticated|"
+                     r"invalid[ _-](?:api[ _-])?key|auth(?:entication|orization)?[ _-]*(?:error|fail(?:ed|ure)?|required)"),
+            ("rate_limit", r"\b429\b|rate[ _-]limit"),
+            ("opencode_error", r'"type"\s*:\s*"error"')):
+        match = re.search(pattern, text, re.I)
+        if match:
+            return reason, " ".join(text[max(0, match.start() - 40):match.end() + 160].split())[:240]
+    return None, None
 
 
 def protected_scope_paths(job, running):
@@ -327,19 +471,45 @@ def reclaim(root):
             except (OSError, ValueError, TypeError):
                 pass
         exit_p = remote_dir(job["id"]) / "exit"
-        if alive and not exit_p.exists():
+        idle_timeout = (alive and not exit_p.exists() and job.get("pool") == "opencode"
+                        and opencode_idle(job, time.time()))
+        if idle_timeout:
+            job.update(kill_worker_group(job.get("pgid") or job["pid"]))
+            job["failure_reason"] = "no_output_timeout"
+            job["failure_detail"] = "No job-local output change for %.0f seconds" % (
+                time.time() - job["output_changed_at"])
+        if alive and not exit_p.exists() and not idle_timeout:
             write_job(root, "running", job)
             continue
         try:
             job["exit"] = int(exit_p.read_text().strip())
         except (OSError, ValueError):
             job["exit"] = None
+        if idle_timeout:
+            job["exit"] = 1
         conc = remote_dir(job["id"]) / "conclusion.md"
         if not conc.exists():
             conc = conc.with_suffix(".txt")  # Already running legacy workers.
         job["conclusion"] = str(conc) if conc.exists() else None
         status, hits = classify_outcome(job["exit"], job["conclusion"], job)
         job["status"] = status
+        if status == "failed" or job["exit"] == 124:
+            text = failure_text(job)
+            reason = None
+            if job.get("pool") == "opencode":
+                reason, detail = opencode_failure(text)
+                if reason:
+                    if not idle_timeout:
+                        job["failure_reason"] = reason
+                    job["failure_detail"] = detail
+            if (status == "failed" and not idle_timeout and reason in (None, "opencode_error")
+                    and upstream_transient(text)):
+                job["failure_reason"] = "upstream_transient"
+                job["failure_detail"] = next((line.strip()[:240] for line in text.splitlines()
+                                              if upstream_transient(line)), "upstream transient error")
+                retried_as = retry_transient(root, job)
+                if retried_as:
+                    job["retried_as"] = retried_as
         if status == "unknown":
             if job["exit"] == 124:
                 job["outcome_reason"] = "worker_timeout"
@@ -398,6 +568,9 @@ def launch(root, job, pool):
     cwd = job.get("cwd") or str(Path.home())
     log, conclusion, exit_file = jd / "log", jd / "conclusion.md", jd / "exit"
     prompt_on_disk.write_text(NO_SUB + body + "\n\n" +
+        "Tests or CI checks already failing on the base branch/main are not blockers for this job. " +
+        "Verify by running the same checks on base, list them under a 'Pre-existing failures' " +
+        "note in the conclusion, and still deliver.\n\n" +
         "CONCLUSION OUTPUT RULE (overrides template paths): Write the final conclusion to " +
         str(conclusion) + ". Keep all conclusion*.md files outside the repository worktree; " +
         "do not create, stage, or commit a conclusion file inside the repository. " +
@@ -410,6 +583,12 @@ def launch(root, job, pool):
     base_sha = git_output(cwd, "rev-parse", "HEAD")
     job.update(pool=pool, model=model, effort=effort, base_sha=base_sha,
                started_at=datetime.now(TZ).isoformat(), conclusion=str(conclusion), log=str(log))
+    created = timestamp(job.get("created_at"))
+    if created:
+        job["queue_wait_s"] = round(max(0, (timestamp(job["started_at"]) - created).total_seconds()), 3)
+    if job.get("queue_reasons"):
+        job["last_queue_reasons"] = job["queue_reasons"]
+    job["queue_reasons"] = []
     # Fake worker is synchronous, requires an explicit isolated state root, and
     # never executes a caller-supplied command or a model CLI.
     if fake:
@@ -452,6 +631,8 @@ def launch(root, job, pool):
                                     stderr=subprocess.STDOUT, start_new_session=True)
         job.update(status="running", pid=proc.pid, pgid=proc.pid)
         (jd / "pid").write_text(str(proc.pid) + "\n")
+    if pool == "opencode":
+        opencode_idle(job, time.time())
     write_job(root, "running", job)
     remove_job(root, "queue", job["id"])
     return job
@@ -577,10 +758,13 @@ def tick(root, resolver=None):
         )
 
     for job in sorted(queued, key=sk):
+        previous_reasons = job.get("queue_reasons") or []
         pool = check_queue(root, job, running, resolver)
         if job["queue_reasons"]:
             write_job(root, "queue", job)
             continue
+        if previous_reasons:
+            job["last_queue_reasons"] = previous_reasons
         try:
             launch(root, job, pool)
         except (OSError, ValueError) as exc:

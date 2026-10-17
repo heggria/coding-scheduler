@@ -187,7 +187,8 @@ CS_TICK_LOG_MAX_BYTES 默认 1048576（最小 256），CS_TICK_LOG_BACKUPS 默�
 事件字段：at（finished_at）、id、project、pool、area、tier、status、exit、elapsed_s、
 prompt_bytes、queue_reason_types（唯一 type 列表）、blocked_reason_class、cancelled_after_done。
 未启动或缺时间的 elapsed_s 为 null；缺 prompt 文件的 prompt_bytes 为 null。
-blocked_reason_class 仅为 blocked 提供粗分类 files_narrow/read_only_write/soft_block/bad_input/other，
+blocked_reason_class 仅为 blocked 提供粗分类 files_narrow/read_only_write/pre_existing_main_failure/
+upstream_transient/soft_block/bad_input/other，
 基于结论与任务字段启发式，不改变 status；其余状态为 null。
 cancelled_after_done 仅在 cancelled 且结论 strip 后存在精确独立行 STATUS: DONE 时为 true。
 
@@ -211,6 +212,24 @@ StatsPanel 以 4s（隐藏页 15s）独立轮询，10s 超时，不受任务表�
 验证映射：E1 → test_scheduler 终态追加/重复动作 + test_stats 轮转；
 S1 → test_stats 窗口/去重/补齐/过滤/分位数/只读 CLI + test_dashboard API/HEAD/参数/只读；
 U1 → scripts/smoke.mjs 数值、三池、轮询、空态、错误恢复与窄屏；smoke_isolated 走假 worker 全链路。
+
+### 可靠性补充（2026-10-17）
+
+- OpenCode running 且无 exit 时，持久化 job-local log/output.jsonl 的 mtime_ns + size 与最后变化时间；
+  启动/最后变化后 `CS_OPENCODE_IDLE_S`（默认 600，非法或非正数回退默认）无变化，复用
+  kill_worker_group 清理后以 exit=1、failed/no_output_timeout 回收。非零/124 扫描本地日志各末尾
+  64 KiB 和结论，保存已知错误分类及短详情；124 保留 unknown，静默超时优先保留 no_output_timeout。
+- exit=0、非空且有精确 BLOCKED 行时，PR URL、created/draft PR #编号或完整 SHA 的交付证据
+  可改记 done，保留 raw_status=blocked 与 delivered_but_blocked warning；否定交付后的 HEAD 不算证据。
+  其他退出证据优先。files_narrow 加授权/白名单/scope/NEED_FILES 词，统计增加上述两种分类。
+- 仅 failed 的上游 transport/capacity/50x/reset 瞬态错误自动重排一次；新单复用提交参数、
+  submission_prompt 和当前模板，记录 retry_of，原单保存 upstream_transient、retried_as。
+  已有 retry_of 不再自动重排；旧单无原始目标时复用完整 prompt，缺 prompt 则记录 retry_error。
+  回收只排队，tick 可在同轮继续调度；不会由回收直接启动真实 worker。
+- tick 在清空排队原因前留存 last_queue_reasons；launch 计算 created_at→started_at 的 queue_wait_s，
+  done 和事件保留，事件 queue_reason_types 使用留存原因。submit 复用 repo/path 锁比较，
+  仅检查其他 running/queued 的 shared_files，输出重叠 ID/路径/串行化 warning，仍接受提交。
+- 三池 worker prompt 统一要求在 base/main 复跑已有失败，并列于 Pre-existing failures，继续交付。
 
 ### 摘要与模板
 

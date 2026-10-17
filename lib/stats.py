@@ -42,6 +42,13 @@ def conclusion_text(job):
         return ""
 
 
+def upstream_transient(text):
+    return bool(re.search(
+        r"transport channel closed|error sending request for url \(https://chatgpt\.com|"
+        r"model is at capacity|http(?:/\S+)?\s+(?:502|503|504)\b|api error:\s*50[0-9]\b|"
+        r"bad gateway|service unavailable|connection reset", text, re.I))
+
+
 def blocked_class(job, text):
     if job.get("status") != "blocked":
         return None
@@ -54,8 +61,15 @@ def blocked_class(job, text):
         return "read_only_write"
     if re.search(r"清单外|列表外|清单.*(?:缺|窄|未包|未涵盖)|不在.*(?:files|清单|列表)|"
                  r"未授权.*文件|文件.*未授权|files.*(?:narrow|allow|list)|"
-                 r"(?:outside|missing|expand|additional).*?(?:files|writable)|需追加.*路径", text):
+                 r"(?:outside|missing|expand|additional).*?(?:files|writable)|需追加.*路径|"
+                 r"需(?:追加|额外|新增)授权|未获写授权|缺少必要文件授权|不在白名单|"
+                 r"outside the (?:allowed|writable) scope|need_files", text):
         return "files_narrow"
+    if re.search(r"also reproduced on (?:origin/)?main|main\s*上同样失败|"
+                 r"pre-existing failure|已在\s*main\s*失败", text):
+        return "pre_existing_main_failure"
+    if upstream_transient(text):
+        return "upstream_transient"
     if re.search(r"坏输入|路径.*(?:不存在|为空)|缺少输入|missing input|input.*(?:missing|invalid)|"
                  r"(?:path|file).*not (?:found|exist)", text):
         return "bad_input"
@@ -73,12 +87,14 @@ def job_event(job):
         prompt_bytes = Path(job["prompt_file"]).stat().st_size if job.get("prompt_file") else None
     except OSError:
         prompt_bytes = None
-    reasons = job.get("queue_reasons") or []
+    reasons = job.get("last_queue_reasons") or job.get("queue_reasons") or []
     return dict(at=job.get("finished_at"), id=job.get("id"), project=job.get("project"),
                 pool=job.get("pool"), area=job.get("area"), tier=job.get("tier"),
                 status=job.get("status"), exit=job.get("exit"),
                 elapsed_s=round(max(0, (end - start).total_seconds()), 3) if start and end else None,
                 prompt_bytes=prompt_bytes,
+                queue_wait_s=job.get("queue_wait_s"),
+                last_queue_reasons=job.get("last_queue_reasons") or [],
                 queue_reason_types=list(dict.fromkeys(r["type"] for r in reasons
                                         if isinstance(r, dict) and isinstance(r.get("type"), str))),
                 blocked_reason_class=blocked_class(job, text),
@@ -95,7 +111,8 @@ def aggregate(events):
     distribution = {status: sum(e["status"] == status for e in events) for status in TERMINAL}
     elapsed, prompts = numbers(events, "elapsed_s"), numbers(events, "prompt_bytes")
     percentile = lambda p: elapsed[max(0, math.ceil(len(elapsed) * p) - 1)] if elapsed else None
-    classes = ("files_narrow", "read_only_write", "soft_block", "bad_input", "other")
+    classes = ("files_narrow", "read_only_write", "pre_existing_main_failure",
+               "upstream_transient", "soft_block", "bad_input", "other")
     return {"total": len(events), "success_rate": distribution["done"] / len(events) if events else None,
             "distribution": distribution,
             "elapsed_s": {"avg": sum(elapsed) / len(elapsed) if elapsed else None,

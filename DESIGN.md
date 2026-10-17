@@ -56,7 +56,7 @@ board 渲染时再按原因短句去重，兼容历史记录。
 
 ### Open Code / Deepseek（已决定）
 
-第三池 `opencode` 默认模型 `opencode/deepseek-v4.1-flash-free`，所有 tier 的 effort/variant 固定 `max`。
+第三池 `opencode` 默认模型 `opencode/deepseek-v4.1-flash`，所有 tier 的 effort/variant 固定 `max`。
 `--pin opencode` 仅等待 OpenCode 空位，不 spill；`--pin codex|cc` 保持既有双池逻辑。
 未 pin 的 L 级低风险任务有 OpenCode 空位时优先进入该池；池满则回到原 Codex/CC 选池。
 其余任务不进入 OpenCode，Codex/CC 的副池永远不包含 OpenCode。
@@ -67,7 +67,7 @@ board 渲染时再按原因短句去重，兼容历史记录。
 research + read_only 是独立豁免。非 Git 路径按 cwd 相对路径检查。
 
 原 `pick_pool` 保持双池：亲和分 → 主池有空位就放；否则副池分 ≥45 才 spill；否则留 queue。
-锁仍阻止任何池启动。OpenCode 免费模型跳过 quota 门禁（缺失、null、0 均不阻塞）；
+锁仍阻止任何池启动。OpenCode 订阅模型跳过 quota 门禁（缺失、null、0 均不阻塞）；
 额度不足不触发跨池回退。OpenCode 的 `--model` override 必须以 `opencode/` 开头，提交选池和启动时均校验。
 
 启动：`opencode run -m <model> --variant max --auto --pure --format json --dir <cwd>`，

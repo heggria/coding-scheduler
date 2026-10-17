@@ -10,7 +10,7 @@
 
 ## 已完成
 - Observability：终态 JSONL 事件（轮转）、`cs stats`（默认近 2h、过滤、分组、耗时/prompt 均值、旧记录只读补齐）、只读 `/api/stats` 与 Command Center 近 2h 成功率/受阻/取消/耗时/三池面板。结果判定保持原语义；实现、隔离验证、合并及 dashboard 部署证据分别见任务外部 conclusion。
-- OpenCode 第三池：L 级低风险优先、满池回退原双池；显式 pin 不外溢，Codex/CC 不向 OpenCode spill。Deepseek 免费模型默认、variant=max、quota 豁免、caps 默认 32、doctor/CLI/dashboard 三池支持。实现与隔离测试交付；真实模型验收未执行，部署以任务结论为准。
+- OpenCode 第三池：L 级低风险优先、满池回退原双池；显式 pin 不外溢，Codex/CC 不向 OpenCode spill。Deepseek 订阅模型默认、variant=max、quota 豁免、caps 默认 32、doctor/CLI/dashboard 三池支持。实现与隔离测试交付；真实模型验收未执行，部署以任务结论为准。
 - wave1：status 回收僵尸、exit0 但无结论→unknown（已修正早期 blocked 规则）、doctor 预检、cancel --superseded-by。
 - launchd 每 60s 自动 tick（`com.heggria.cs-tick`）。
 - Codex/CC 完全访问权限（bypass sandbox / skip-permissions）。

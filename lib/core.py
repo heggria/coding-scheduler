@@ -629,7 +629,8 @@ def launch(root, job, pool):
                           "export CS_JOB_ID=" + q(job["id"]) + "\n" +
                           "cd " + q(cwd) + "\n" + command + "\n")
         with log.open("w") as output:
-            proc = subprocess.Popen(["bash", str(run_sh)], stdout=output,
+            # Detach stdin: opencode run reads a non-TTY stdin and blocks forever on it.
+            proc = subprocess.Popen(["bash", str(run_sh)], stdin=subprocess.DEVNULL, stdout=output,
                                     stderr=subprocess.STDOUT, start_new_session=True)
         job.update(status="running", pid=proc.pid, pgid=proc.pid)
         (jd / "pid").write_text(str(proc.pid) + "\n")

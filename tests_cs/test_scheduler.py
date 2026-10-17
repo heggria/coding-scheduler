@@ -330,6 +330,7 @@ class SchedulerTests(unittest.TestCase):
                 patch.object(core.subprocess, "Popen", return_value=Mock(pid=123)) as popen:
             core.launch(self.root, job, "opencode")
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertIs(popen.call_args.kwargs["stdin"], core.subprocess.DEVNULL)
         self.assertEqual(job["pgid"], 123)
         self.assertEqual(job["effort"], "max")
         worker = core.remote_dir(job["id"])

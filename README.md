@@ -40,7 +40,7 @@ cs board --json
   stderr 打印提示，`submit --json` 顶层 `warnings` 返回同一列表。
   测试、manifest 对应 lock 和前端构建产物的补充提示仅在 strict 下出现；所有策略在
   `--lock-shared` 超过 3 个路径时提示同仓库兄弟任务的串行化影响。
-- `--model` 透传给所选 codex/claude/opencode（OpenCode 要求 `opencode/` 前缀），省略沿用默认模型；`research` 和显式 `--read-only`
+- `--model` 透传给所选 codex/claude/opencode（OpenCode 要求 `opencode/` 或 `opencode-go/` 前缀），省略沿用默认模型；`research` 和显式 `--read-only`
   的单可交付分析结论；这不豁免上述 `--files` 要求。结论提到“未提交/未推送/只读”等不再误判 blocked。
   所有任务统一使用下述退出证据与结构化状态规则，不扫描自然语言未交付短语。
 - submit 默认只排队，并立即返回全部已知阻塞原因和 `awaiting_tick`；`--tick` 才尝试启动。
@@ -161,7 +161,7 @@ Codex/CC/OpenCode 并发上限默认 24/6/32，运行时读取 `{CS_HOME}/caps.j
 低风险为 research + read-only，或 files ≤3、无 shared_files、risk≠high 且无高风险路径；
 仓库相对路径前缀 `lib/core.py`、`lib/affinity.py`、`bin/`、`launchd/` 为高风险。
 `--pin opencode` 只等待此池，`--pin codex|cc` 保持旧逻辑；OpenCode 不参与 spill。
-默认模型 `opencode/deepseek-v4.1-flash`，variant 固定 `max`（2.x CLI 以 `model#max` 传入）；此池为订阅，豁免 quota.json 门禁。
+默认模型 `opencode-go/deepseek-v4.1-flash`，variant 固定 `max`（2.x CLI 以 `model#max` 传入）；此池为订阅，豁免 quota.json 门禁。
 JSONL text parts 提取为外部 conclusion.md，原始事件留在 worker 的 output.jsonl / log。
 
 可选真实冒烟命令（不属于自动测试；显式执行才调用真实模型）：

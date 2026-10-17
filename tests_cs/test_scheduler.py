@@ -281,7 +281,7 @@ class SchedulerTests(unittest.TestCase):
         (self.root / "quota.json").unlink()
         for tier in ("L", "M", "H"):
             self.assertEqual(core.model_for("opencode", tier),
-                             ("opencode/deepseek-v4.1-flash", "max"))
+                             ("opencode-go/deepseek-v4.1-flash", "max"))
         for pool in ("opencode", "codex", "cc"):
             self.submit(pool, "--pin", pool, "--tier", "L", "--prompt-text", "fixture", "--tick")
             self.assertEqual(core.find_job(self.root, pool)["pool"], pool)

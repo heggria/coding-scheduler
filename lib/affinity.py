@@ -122,7 +122,7 @@ def pick_pool(codex_s, cc_s, free_codex, free_cc):
 
 def model_for(pool, tier):
     if pool == "opencode":
-        return "opencode/deepseek-v4.1-flash", "max"
+        return "opencode-go/deepseek-v4.1-flash", "max"
     effort = {"L": "low", "M": "medium", "H": "high"}.get(tier, "medium")
     if pool == "codex":
         return "gpt-6.1-sol", effort

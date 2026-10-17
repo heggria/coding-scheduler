@@ -367,8 +367,8 @@ def reclaim(root):
 
 
 def validate_model(pool, model):
-    if pool == "opencode" and model and not model.startswith("opencode/"):
-        raise ValueError("opencode pool requires an --model with opencode/ prefix")
+    if pool == "opencode" and model and not model.startswith(("opencode/", "opencode-go/")):
+        raise ValueError("opencode pool requires an --model with opencode/ or opencode-go/ prefix")
 
 
 def extract_opencode_text(source, destination):

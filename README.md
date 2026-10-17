@@ -38,6 +38,8 @@ cs board --json
   指定 `--read-only` 也必须列出文件。非空目录锁仍只警告，不拒绝。
 - `--scope-policy strict|companion|flex` 默认 **companion**，详见下节。范围偏窄仅警告，
   stderr 打印提示，`submit --json` 顶层 `warnings` 返回同一列表。
+  测试、manifest 对应 lock 和前端构建产物的补充提示仅在 strict 下出现；所有策略在
+  `--lock-shared` 超过 3 个路径时提示同仓库兄弟任务的串行化影响。
 - `--model` 透传给所选 codex/claude/opencode（OpenCode 要求 `opencode/` 前缀），省略沿用默认模型；`research` 和显式 `--read-only`
   的单可交付分析结论；这不豁免上述 `--files` 要求。结论提到“未提交/未推送/只读”等不再误判 blocked。
   所有任务统一使用下述退出证据与结构化状态规则，不扫描自然语言未交付短语。

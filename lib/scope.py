@@ -91,10 +91,14 @@ def scope_report(changed_files, files, shared_files, policy):
     return result
 
 
-def narrow_warnings(files):
+def narrow_warnings(files, policy, shared_files=()):
     """Submit-time hints only; unknown build layout never rejects a job."""
-    paths = [PurePosixPath(normalize(path)) for path in files]
     warnings = []
+    if len(shared_files) > 3:
+        warnings.append("many --lock-shared paths serialize sibling jobs on the same repo; consider narrowing shared locks")
+    if policy != "strict":
+        return warnings
+    paths = [PurePosixPath(normalize(path)) for path in files]
     for path in paths:
         if path.name in LOCKS and not any(path.parent / lock in paths for lock in LOCKS[path.name]):
             warnings.append("%s: consider adding its lock file or rely on companion allowance" % path)

@@ -113,7 +113,7 @@ def cmd_submit(args):
         "read_only": args.read_only,
         "scope_policy": args.scope_policy, "user_prompt": user_prompt,
         "no_template": args.no_template,
-        "warnings": narrow_warnings(files),
+        "warnings": narrow_warnings(files, args.scope_policy, shared_files),
     }
     if getattr(args, "retry_of", None):
         job["retry_of"] = args.retry_of

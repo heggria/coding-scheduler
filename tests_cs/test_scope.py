@@ -51,11 +51,27 @@ class ScopeTests(unittest.TestCase):
             scope_report([], [], [], "typo")
 
     def test_warning_heuristics(self):
-        self.assertEqual(narrow_warnings([]), [])
-        self.assertEqual(narrow_warnings(["src/x.py", "tests/test_x.py"]), [])
-        self.assertIn("tests/test_x.py", narrow_warnings(["src/x.py"])[0])
-        self.assertTrue(narrow_warnings(["package.json"]))
-        self.assertEqual(narrow_warnings(["package.json", "yarn.lock"]), [])
-        self.assertEqual(narrow_warnings(["web/pyproject.toml", "web/uv.lock"]), [])
-        self.assertTrue(any("build output" in warning for warning in narrow_warnings(["src/x.tsx"])))
-        self.assertEqual(narrow_warnings(["src/x.tsx", "src/x.test.tsx", "dist/x.js"]), [])
+        self.assertEqual(narrow_warnings([], "strict"), [])
+        self.assertEqual(narrow_warnings(["src/x.py", "tests/test_x.py"], "strict"), [])
+        self.assertIn("tests/test_x.py", narrow_warnings(["src/x.py"], "strict")[0])
+        self.assertTrue(narrow_warnings(["package.json"], "strict"))
+        self.assertEqual(narrow_warnings(["package.json", "yarn.lock"], "strict"), [])
+        self.assertEqual(narrow_warnings(["web/pyproject.toml", "web/uv.lock"], "strict"), [])
+        self.assertTrue(any("build output" in warning for warning in
+                            narrow_warnings(["src/x.tsx"], "strict")))
+        self.assertEqual(narrow_warnings(["src/x.tsx", "src/x.test.tsx", "dist/x.js"], "strict"), [])
+
+    def test_companion_and_flex_suppress_scope_hints(self):
+        for policy in ("companion", "flex"):
+            with self.subTest(policy=policy):
+                self.assertEqual(narrow_warnings(["src/x.py", "src/card.tsx", "package.json"], policy), [])
+
+    def test_many_shared_locks_warn_for_every_policy(self):
+        shared = ["core/a.py", "core/b.py", "core/c.py", "core/d.py"]
+        for policy in ("strict", "companion", "flex"):
+            with self.subTest(policy=policy):
+                self.assertEqual(narrow_warnings([], policy, shared[:3]), [])
+                warnings = narrow_warnings([], policy, shared)
+                self.assertEqual(len(warnings), 1)
+                self.assertIn("--lock-shared", warnings[0])
+                self.assertIn("serialize sibling jobs on the same repo", warnings[0])

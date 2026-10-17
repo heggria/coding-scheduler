@@ -422,7 +422,7 @@ class SchedulerTests(unittest.TestCase):
                                  "--prompt-text", "goal", *flags)
             job = core.find_job(self.root, policy)
             self.assertEqual(job["scope_policy"], policy)
-            self.assertTrue(result["warnings"])
+            self.assertEqual(bool(result["warnings"]), policy == "strict")
             prompt = Path(job["prompt_file"]).read_text()
             self.assertIn("改动范围策略 (scope policy): " + policy, prompt)
             self.assertIn("OUT_OF_SCOPE_FILES:", prompt)
@@ -431,11 +431,15 @@ class SchedulerTests(unittest.TestCase):
                 self.assertIn("stay strictly within --files", prompt)
             else:
                 self.assertIn("overrides generic strict wording", prompt)
+            shared = self.submit(policy + "-shared", "--area", "backend", "--files", "review.md",
+                                 "--lock-shared", "a.py,b.py,c.py,d.py", "--prompt-text", "goal", *flags)
+            self.assertEqual(len(shared["warnings"]), 1)
+            self.assertIn("serialize sibling jobs on the same repo", shared["warnings"][0])
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()), \
                 patch.object(sys, "argv", ["cs", "submit", "--project", "fixture", "--area", "backend",
                                           "--tier", "M", "--cwd", str(self.cwd), "--files", "package.json",
-                                          "--prompt-text", "goal"]):
+                                          "--scope-policy", "strict", "--prompt-text", "goal"]):
             self.assertEqual(CLI["main"](), 0)
         self.assertIn("consider adding its lock file", stderr.getvalue())
 

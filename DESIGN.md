@@ -65,7 +65,8 @@ dispatcher 保持旧行为需显式 `--scope-policy strict`，不要因追加普
 `lib/scope.py` 仅 stdlib、纯路径规则：同 stem Python/TS 测试，同 feature e2e spec，
 fixtures/__snapshots__/testdata 与 *.snap，祖先包 __init__.py，同目录 manifest 对应 lock，
 任意 dist/build/static/dist、*.min.js、*.map 和带 generated 标记的 i18n/locales/translations bundle。
-精确规则见 README；不探测构建工具、不执行 Git。narrow_warnings 仅建议补测试/lock/build 产物，
+精确规则见 README；不探测构建工具、不执行 Git。narrow_warnings 仅在 strict 下建议补测试/lock/build 产物，
+所有策略在 shared_files 超过 3 个路径时提示同仓库兄弟任务的串行化影响；
 stderr 和 submit JSON warnings 暴露，不拒单。范围许可不改变现有锁集合。
 
 每个声明外改动在结论独立 `OUT_OF_SCOPE_FILES:` 后用 bullet 路径加一行原因列出（含 companion）。

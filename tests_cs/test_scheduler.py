@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "lib"))
 import core
+from scope import policy_text
 from affinity import pick_pool
 
 CLI = runpy.run_path(str(REPO / "bin/cs"), run_name="cs_cli")
@@ -383,7 +384,7 @@ class SchedulerTests(unittest.TestCase):
         first = self.submit("inline", "--prompt-text", "goal")
         self.assertEqual(first["schema_version"], "1")
         self.assertEqual((self.root / "queue/inline.prompt.md").read_text(),
-                         "project rules\n\n" + declaration + "\n\ngoal")
+                       "project rules\n\n" + declaration + "\n\n" + policy_text("companion") + "\n\ngoal")
         self.assertEqual(first["job"]["queue_reasons"][-1]["type"], "awaiting_tick")
         self.submit("stdin", "--prompt", "-", stdin="stdin goal")
         self.assertIn("stdin goal", (self.root / "queue/stdin.prompt.md").read_text())
@@ -391,9 +392,10 @@ class SchedulerTests(unittest.TestCase):
         prompt.write_text("file goal")
         self.submit("file", "--prompt", str(prompt))
         self.assertEqual((self.root / "queue/file.prompt.md").read_text(),
-                         "project rules\n\n" + declaration + "\n\nfile goal")
+                         "project rules\n\n" + declaration + "\n\n" + policy_text("companion") + "\n\nfile goal")
         self.submit("off", "--prompt-text", "raw", "--no-template")
-        self.assertEqual((self.root / "queue/off.prompt.md").read_text(), declaration + "\n\nraw")
+        self.assertEqual((self.root / "queue/off.prompt.md").read_text(),
+                         declaration + "\n\n" + policy_text("companion") + "\n\nraw")
 
     def test_submit_declaration_for_write_read_only_and_no_template(self):
         (self.root / "projects/fixture.md").write_text("project rules\n")
@@ -411,7 +413,72 @@ class SchedulerTests(unittest.TestCase):
                                '- shared 锁文件 (shared_files): %s\n- area: backend\n- read-only: %s'
                                % (self.cwd, files, shared, read_only))
                 prefix = "" if jid == "no-template" else "project rules\n\n"
-                self.assertEqual(prompt, prefix + declaration + "\n\ntask goal")
+                self.assertEqual(prompt, prefix + declaration + "\n\n" + policy_text("companion") + "\n\ntask goal")
+
+    def test_scope_policy_prompt_and_warning_output(self):
+        for policy in ("companion", "strict", "flex"):
+            flags = [] if policy == "companion" else ["--scope-policy", policy]
+            result = self.submit(policy, "--area", "backend", "--files", "src/x.py",
+                                 "--prompt-text", "goal", *flags)
+            job = core.find_job(self.root, policy)
+            self.assertEqual(job["scope_policy"], policy)
+            self.assertTrue(result["warnings"])
+            prompt = Path(job["prompt_file"]).read_text()
+            self.assertIn("改动范围策略 (scope policy): " + policy, prompt)
+            self.assertIn("OUT_OF_SCOPE_FILES:", prompt)
+            self.assertIn("NEED_FILES: path1, path2", prompt)
+            if policy == "strict":
+                self.assertIn("stay strictly within --files", prompt)
+            else:
+                self.assertIn("overrides generic strict wording", prompt)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()), \
+                patch.object(sys, "argv", ["cs", "submit", "--project", "fixture", "--area", "backend",
+                                          "--tier", "M", "--cwd", str(self.cwd), "--files", "package.json",
+                                          "--prompt-text", "goal"]):
+            self.assertEqual(CLI["main"](), 0)
+        self.assertIn("consider adding its lock file", stderr.getvalue())
+
+    def test_need_files_and_retry_merge_preserves_original(self):
+        self.submit("original", "--area", "backend", "--files", "src/x.py", "--lock-shared", "core.py",
+                    "--prompt-text", "raw goal", "--model", "custom-model", "--no-template", "--tick")
+        worker = core.remote_dir("original")
+        (worker / "conclusion.md").write_text("STATUS: BLOCKED\n NEED_FILES: tests/test_x.py, extra.py \n"
+                                             "NEED_FILES: extra.py, more.py\n")
+        original = json.loads(self.cli("wait", "original"))["jobs"][0]
+        self.assertEqual(original["need_files"], ["tests/test_x.py", "extra.py", "more.py"])
+        path = self.root / "done/original.json"
+        before = path.read_bytes()
+        result = json.loads(self.cli("retry", "original", "--add-files", "extra.py,manual.py",
+                                     "--add-shared", "extra-core.py", "--use-need-files",
+                                     "--scope-policy", "flex", "--idempotency-key", "retry-1", "--json"))
+        job = core.find_job(self.root, result["id"])
+        self.assertEqual(job["files"], ["src/x.py", "extra.py", "manual.py", "tests/test_x.py", "more.py"])
+        self.assertEqual(job["shared_files"], ["core.py", "extra-core.py"])
+        self.assertEqual(job["retry_of"], "original")
+        self.assertEqual(job["scope_policy"], "flex")
+        self.assertEqual(job["user_prompt"], "raw goal")
+        self.assertEqual(job["model"], "custom-model")
+        prompt = Path(job["prompt_file"]).read_text()
+        self.assertEqual(prompt.count("## 本单声明"), 1)
+        self.assertTrue(prompt.endswith("raw goal"))
+        self.assertEqual(path.read_bytes(), before)
+        again = json.loads(self.cli("retry", "original", "--idempotency-key", "retry-1", "--json"))
+        self.assertTrue(again["existing"])
+        self.assertEqual(again["id"], job["id"])
+        self.cli("tick", "--json")
+        self.cli("wait", job["id"])
+        result = json.loads(self.cli("retry", job["id"], "--tick", "--json"))
+        self.assertEqual(result["job"]["status"], "running")
+
+    def test_retry_refuses_active_missing_and_legacy_jobs(self):
+        self.submit("queued", "--prompt-text", "goal")
+        self.cli("retry", "queued", "--json", expected=2)
+        self.submit("running", "--prompt-text", "goal", "--tick")
+        self.cli("retry", "running", "--json", expected=2)
+        self.cli("retry", "missing", "--json", expected=1)
+        self.record("legacy", "done", status="blocked")
+        self.cli("retry", "legacy", "--json", expected=2)
 
     def test_prompt_sources_mutually_exclusive_and_required_json_errors(self):
         for extra in [(), ("--prompt-text", "x", "--prompt", "-")]:
@@ -473,7 +540,7 @@ class SchedulerTests(unittest.TestCase):
     def test_submit_tick_json_contains_only_submitted_job(self):
         self.submit("other", "--prompt-text", "another task")
         result = self.submit("mine", "--prompt-text", "my task", "--tick")
-        self.assertEqual(set(result), {"schema_version", "id", "existing", "job"})
+        self.assertEqual(set(result), {"schema_version", "id", "existing", "job", "warnings"})
         self.assertNotIn("other", json.dumps(result))
         self.assertEqual(result["job"]["status"], "running")
         self.assertEqual(core.find_job(self.root, "other")["status"], "running")
@@ -941,6 +1008,61 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(summary["changed_files"], ["a.txt"])
         self.assertIn("a.txt", summary["diff_stat"])
         self.assertIn("2 insertions", summary["diff_stat"])
+        stored = core.find_job(self.root, "git")
+        self.assertEqual(stored["changed_files"], ["a.txt"])
+        self.assertEqual(stored["scope"]["out_of_scope"], ["a.txt"])
+        (self.cwd / "later.txt").write_text("after completion")
+        self.assertEqual(json.loads(self.cli("status", "git", "--json"))["job"]["changed_files"], ["a.txt"])
+
+    def test_completion_scope_untracked_protected_and_own_shared(self):
+        def git(*args):
+            return subprocess.run(["git", "-C", str(self.cwd), *args], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        git("init")
+        git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "commit", "--allow-empty", "-m", "base")
+        self.submit("scope", "--area", "backend", "--files", str(self.cwd / "src/x.py"),
+                    "--lock-shared", "own.py", "--prompt-text", "goal", "--tick")
+        self.record("other", "running", status="running", pid=os.getpid(), shared_files=["dist"])
+        for name in ("src/x.py", "tests/test_x.py", "dist/x.js", "own.py", "extra.py"):
+            path = self.cwd / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("new")
+        git("add", "src/x.py")
+        job = json.loads(self.cli("wait", "scope"))["jobs"][0]
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(job["changed_files"], ["dist/x.js", "extra.py", "own.py", "src/x.py", "tests/test_x.py"])
+        self.assertEqual(job["scope"], dict(declared=["own.py", "src/x.py"], companion=["tests/test_x.py"],
+                                          out_of_scope=["dist/x.js", "extra.py"], shared_violations=["dist/x.js"]))
+        stored = core.find_job(self.root, "scope")
+        stored["cwd"] = str(self.cwd / "src")
+        core.completion_scope(stored, [core.find_job(self.root, "other")])
+        self.assertEqual(stored["changed_files"], ["x.py"])
+        core.completion_scope(dict(stored, cwd=str(self.base)), [])  # non-Git must not crash
+
+    def test_protected_scope_maps_worktrees_and_ignores_other_repositories(self):
+        def git(directory, *args):
+            return subprocess.run(["git", "-C", str(directory), *args], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        git(self.cwd, "init")
+        git(self.cwd, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "commit", "--allow-empty", "-m", "base")
+        sibling = self.base / "sibling"
+        git(self.cwd, "worktree", "add", "-b", "sibling", str(sibling))
+        other = self.base / "unrelated"
+        other.mkdir()
+        git(other, "init")
+        running = [dict(id="sibling", cwd=str(sibling), shared_files=["src/core.py", "dist"]),
+                   dict(id="unrelated", cwd=str(other), shared_files=["other.py"]),
+                   dict(id="self", cwd=str(self.cwd), shared_files=["own.py"])]
+        job = dict(id="self", cwd=str(self.cwd))
+        self.assertEqual(core.protected_scope_paths(job, running), ["src/core.py", "dist"])
+        subdir = self.cwd / "src"
+        subdir.mkdir()
+        self.assertEqual(core.protected_scope_paths(dict(job, cwd=str(subdir)), running),
+                         ["core.py", "../dist"])
+        running[0]["shared_files"] = ["."]
+        self.assertEqual(core.protected_scope_paths(dict(job, cwd=str(subdir)), running), ["."])
 
     def test_model_override_and_default_launch_arguments_safe_shell_and_failure_exit(self):
         self.submit("model", "--prompt-text", "goal", "--model", "custom-model", "--tick")

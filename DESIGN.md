@@ -12,6 +12,8 @@ cs tick
 cs status [<id>] [--json]
 cs wait <id> [<id>...] [--tick] [--timeout SEC] [--lines N]
 cs cancel <id>
+cs retry <id> [--add-files a,b] [--add-shared x] [--use-need-files] [--scope-policy strict|companion|flex]
+  [--idempotency-key K] [--tick] [--json]
 cs board
 cs stats [--since 2h|30m|1d|ISO] [--project NAME] [--pool codex|cc|opencode] [--json]
 cs doctor
@@ -51,6 +53,41 @@ board 渲染时再按原因短句去重，兼容历史记录。
 **mm / OD 提交方迁移**：同仓库不同 worktree 修改同一文件，现在默认可以并行。
 如核心文件在合并时仍需串行，请显式增加 `--lock-shared`；已有 `--files` 不会自动
 升级为共享锁。检查整目录 / cwd 锁的警告，尽量声明实际文件范围。
+
+## Scope policy 与显式 retry
+
+submit 默认 `--scope-policy companion`，保存 `scope_policy` 并在本单声明中生成
+“改动范围策略 (scope policy)”中英规则。该声明覆盖其他 prompt 中通用的严格文件清单措辞。
+`strict` 保留旧行为；`companion` 允许声明文件及自然伴随文件，其他范围需 BLOCKED；
+`flex` 允许任务必需的所有非共享文件，未声明的 shared/core 保护仍严格，read-only 仍有效。
+dispatcher 保持旧行为需显式 `--scope-policy strict`，不要因追加普通文件自动追加共享锁。
+
+`lib/scope.py` 仅 stdlib、纯路径规则：同 stem Python/TS 测试，同 feature e2e spec，
+fixtures/__snapshots__/testdata 与 *.snap，祖先包 __init__.py，同目录 manifest 对应 lock，
+任意 dist/build/static/dist、*.min.js、*.map 和带 generated 标记的 i18n/locales/translations bundle。
+精确规则见 README；不探测构建工具、不执行 Git。narrow_warnings 仅建议补测试/lock/build 产物，
+stderr 和 submit JSON warnings 暴露，不拒单。范围许可不改变现有锁集合。
+
+每个声明外改动在结论独立 `OUT_OF_SCOPE_FILES:` 后用 bullet 路径加一行原因列出（含 companion）。
+范围受阻写独立 `STATUS: BLOCKED` 和 `NEED_FILES: path1, path2`；reclaim 仅在 blocked 时
+解析后者、去重保存 need_files；stats 优先将非空 need_files 的 blocked 单归为 files_narrow，保留旧 regex。
+
+reclaim 在 finished_at 前对 base_sha 执行 git diff --relative --no-renames --name-only -z，
+合并 git ls-files --others --exclude-standard 的未跟踪文件，保存 changed_files 与 scope。
+路径相对于 cwd，绝对声明先归一化；其他运行单的共享锁只纳入同 Git common-dir（跨 worktree 映射），
+非 Git 用绝对路径关系。自身 files + shared_files 都算 declared，不构成 shared_violations。
+scope_report 的 shared_files 参数是外部保护集合：未声明且命中保护路径的文件归 shared_violations，
+保护优先于 companion。declared/companion/out_of_scope 互斥，shared_violations 是 out_of_scope 子集；
+strict 不给予 companion，flex 的 out_of_scope 仍记录非伴随文件，但不意味着需要受阻。
+这里只观测，不改状态；非 Git、无 base_sha 或 Git diff 失败保存空快照，不能视作无改动证明。
+终态 status/wait 返回存储快照，旧单/运行单仍可实时查询，diff_stat 保留实时语义。
+
+submit 保存原始 user_prompt、no_template 和 requested_model（launch 的 model 会变为实际模型）。
+retry 在同一状态锁内克隆终态单的用户目标及提交参数，原列表按顺序去重追加 add-files、可选 need_files，
+add-shared 仅追加共享锁，不自动升级普通文件；生成新 ID、retry_of、新声明和当前模板。
+策略默认继承原单（旧单无策略为 strict）；幂等键复用现有 submit 语义，不继承原幂等键。
+不改原单，不自动 tick，除非明确 --tick；原单 queued/running 时拒绝。
+旧单缺 user_prompt 无法安全区分模板与用户正文，明确拒绝，要求重新 submit。
 
 ## 选池
 
@@ -179,7 +216,8 @@ U1 → scripts/smoke.mjs 数值、三池、轮询、空态、错误恢复与窄�
 start 记录 cwd HEAD 为 base_sha；wait / status <id> 在 cwd 对比该 SHA 到当前工作区，
 提供 diff_stat 和 changed_files，包含之后提交的改动（不是只比较当前 HEAD）。
 非 Git 或旧单无 SHA 时省略。统计是读取时该 cwd 的实时快照，非每单独占的改动归因；
-同 cwd 并行单和任务开始前已有的脏改动也可能出现在统计内，不含 untracked。
+同 cwd 并行单和任务开始前已有的脏改动也可能出现在统计内。回收快照额外包含未忽略的 untracked；
+Git diff_stat 仍不含 untracked。
 conclusion 仅输出前 N 行，PR 链接扫描全文并去重，支持 https://github.com/.../pull/N。
 
 模板从 `<状态根>/projects/<project>.md` 读取并在 submit 时快照到 prompt_file，

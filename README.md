@@ -36,6 +36,8 @@ cs board --json
 - `--files` 必须逐一列出输出/可写文件的准确路径（包括要写的评审文档），不要填目录。
   仅同时指定 `--area research --read-only` 时允许为空；review/backend 等即使
   指定 `--read-only` 也必须列出文件。非空目录锁仍只警告，不拒绝。
+- `--scope-policy strict|companion|flex` 默认 **companion**，详见下节。范围偏窄仅警告，
+  stderr 打印提示，`submit --json` 顶层 `warnings` 返回同一列表。
 - `--model` 透传给所选 codex/claude/opencode（OpenCode 要求 `opencode/` 前缀），省略沿用默认模型；`research` 和显式 `--read-only`
   的单可交付分析结论；这不豁免上述 `--files` 要求。结论提到“未提交/未推送/只读”等不再误判 blocked。
   所有任务统一使用下述退出证据与结构化状态规则，不扫描自然语言未交付短语。
@@ -49,7 +51,8 @@ cs board --json
 - wait / 单单 status 返回状态、退出码、耗时秒、产物 log/conclusion/worktree 路径、
   conclusion 前 N 行（默认 20）及从完整 conclusion 提取的 GitHub PR 链接。
   Git 任务 start 时记 `base_sha`，摘要在 cwd 用 `git diff --stat <base_sha> -- .` 及文件列表，
-  包括起点后的已提交和未提交跟踪文件改动；未跟踪文件不在 git diff 中。
+  运行期间包括起点后的已提交和未提交跟踪文件改动；回收后 `changed_files` 固定为结束时
+  的快照，并加入未忽略的未跟踪文件。`diff_stat` 仍为读取时的 Git 跟踪文件统计。
   非 Git、旧单缺少 base_sha 或 Git 查询失败时省略 diff 字段。
 - status 默认回收任务并重写 board；`--no-reclaim`（别名 `--read-only`）只读取当前记录，
   不回收、不初始化目录、不创建锁文件、不重写 board。并发 tick 时读取结果可能跨越状态转换。
@@ -64,6 +67,52 @@ cs board --json
   `claude_trusted_dir_hint` 仅检查 `.claude.json` 中 cwd 的准确项目路径及
   `hasTrustDialogAccepted: true`；普通目录、worktree 未确认信任时为 WARN，
   不阻止启动，也不代表实际信任失败（worker 已使用 skip-permissions）。
+
+## 改动范围与重试
+
+`--files` 和 `--lock-shared` 仍用于原有锁调度，companion 许可不会自动加锁。
+声明文件包含本单这两份列表；默认 companion 策略覆盖模板、dispatcher 或目标中通用的
+“strictly within --files; STOP BLOCKED”措辞，允许无需询问地修改以下伴随文件：
+
+- 同 stem 测试：`tests/**/test_<stem>*.py`、`<stem>_test.py`、`<stem>.test.ts(x)`、
+  `<stem>.spec.ts(x)`，以及同 feature 目录 `e2e/` 下同 stem 的 JS/TS spec、cy、e2e 文件。
+- 任意位置的 `fixtures/`、`__snapshots__/`、`testdata/` 内容及 `*.snap`。
+- 声明文件祖先包目录中的 `__init__.py`。
+- 同目录 manifest 的 lock：`package.json` 对应 package-lock/pnpm-lock/yarn.lock；
+  `pyproject.toml` 对应 uv.lock/poetry.lock；Cargo.toml 对应 Cargo.lock；go.mod 对应 go.sum。
+- 任意位置 `dist/`、`build/`（含 `static/dist/`）、`*.min.js`、`*.map`；
+  i18n/locales/translations 中位于 `generated/` 下或名含 `.generated.` 的生成 bundle。
+
+其他文件仍须范围受阻；`strict` 保留旧措辞，清单外一律先申请。
+`flex` 允许任务所需的任何非 shared/core 文件；未声明的共享/核心保护路径在所有策略下仍严格。
+声明显示同仓库其他运行任务共享锁的保护快照，项目模板中的核心保护也仍有效。
+read-only 不因范围策略而变为可写。规则是简单路径启发式，不是权限执行器。
+
+每个清单外改动（含 companion）必须在结论中列出：
+
+```text
+OUT_OF_SCOPE_FILES:
+- tests/test_x.py: 验证模块修改
+```
+
+因范围受阻时写独立 `STATUS: BLOCKED`，并另写 `NEED_FILES: path1, path2`。
+回收将其去重保存为 `need_files`，统计归入 `files_narrow`。dispatcher 可显式重试：
+
+```bash
+cs retry <id> --use-need-files --add-files extra.py --scope-policy companion --tick --json
+cs retry <id> --add-shared shared/core.py --idempotency-key retry-123 --json
+```
+
+retry 只接受终态单，创建新 ID 并保存 `retry_of`；克隆项目、area/tier/cwd/risk/pin/model/read_only、
+文件与共享锁、模板开关、范围策略及原始用户目标，重新生成声明。新增 files 不会自动升级共享锁；
+原单不变。未给 `--tick` 只排队，不会自动重试。新增单保存 `user_prompt`，旧单缺少原始目标时
+retry 明确拒绝，需手工重新 submit；旧单无策略按 strict 继承。
+
+回收保存 `changed_files` 和 `scope`（declared/companion/out_of_scope/shared_violations），
+共享保护集合来自结束时同仓库其他仍运行任务。只观测、不改结果状态；flex 的 out_of_scope
+仍记录非伴随文件，不表示受阻。非 Git/缺 base_sha/查询失败保存空报告，不能据此证明没有改动。
+快照可能含起点前的脏文件和同 cwd 并行任务改动，不是独占归因。
+dispatcher 若要保留旧范围行为，请显式传 `--scope-policy strict`。
 
 tick 默认输出一行 JSON 计数摘要；`tick --json` 返回完整调度明细。
 `<状态根>/logs/tick.log` 每轮仅一行摘要，不重复输出排队原因。

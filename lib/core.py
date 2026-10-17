@@ -19,6 +19,7 @@ from pathlib import Path
 import affinity
 from affinity import CC_CAP, CODEX_CAP, OPENCODE_CAP, model_for, pick_pool, score
 from locks import GitLockResolver, file_conflict, lock_context
+from scope import scope_report
 
 TZ = timezone(timedelta(hours=8))
 NO_SUB = (
@@ -238,7 +239,8 @@ def job_summary(job, lines=20):
                             "worktree": job.get("cwd")},
               "queue_reasons": job.get("queue_reasons", []),
               "last_checked": job.get("last_checked")}
-    for field in ("pgid", "cancel_killed_pids", "cancel_signal"):
+    for field in ("pgid", "cancel_killed_pids", "cancel_signal", "scope_policy", "scope",
+                  "changed_files", "need_files", "retry_of"):
         if field in job:
             result[field] = job[field]
     if job.get("outcome_reason"):
@@ -250,7 +252,8 @@ def job_summary(job, lines=20):
         names = git_output(job["cwd"], "diff", "--name-only", "-z", job["base_sha"], "--", ".")
         if stat is not None and names is not None:
             result["diff_stat"] = stat
-            result["changed_files"] = [name for name in names.split("\0") if name]
+            if "changed_files" not in job:
+                result["changed_files"] = [name for name in names.split("\0") if name]
     return result
 
 
@@ -269,6 +272,47 @@ def classify_outcome(exit_code, conclusion_path, job=None):
     if any(line.strip() == "STATUS: BLOCKED" for line in text.splitlines()):
         return "blocked", ["STATUS: BLOCKED"]
     return "done", None
+
+
+def protected_scope_paths(job, running):
+    """Map other jobs' same-repo shared locks into this job's cwd coordinates."""
+    resolver = GitLockResolver()
+    cwd = Path(job["cwd"]).resolve()
+    repo = resolver(cwd)
+    paths = []
+    for other in running:
+        if other["id"] == job["id"]:
+            continue
+        for lock in lock_context(other, resolver)["locks"]:
+            if lock["kind"] != "shared":
+                continue
+            if repo and lock["repo_id"] == repo[0]:
+                target = Path(repo[1]) / lock["relpath"]
+            elif not repo and lock["repo_id"] is None:
+                target = Path(lock["relpath"])
+            else:
+                continue
+            paths.append("." if cwd.is_relative_to(target) else os.path.relpath(str(target), str(cwd)))
+    return list(dict.fromkeys(paths))
+
+
+def completion_scope(job, running):
+    """Best-effort repository snapshot, including untracked files; never enforce."""
+    cwd = job.get("cwd")
+    names = None
+    if cwd and job.get("base_sha"):
+        names = git_output(cwd, "diff", "--relative", "--no-renames", "--name-only", "-z",
+                           job["base_sha"], "--", ".")
+    changed = [name for name in (names or "").split("\0") if name]
+    if names is not None:
+        untracked = git_output(cwd, "ls-files", "--others", "--exclude-standard", "-z", "--", ".")
+        changed.extend(name for name in (untracked or "").split("\0") if name)
+    job["changed_files"] = sorted(set(changed))
+    declared = [os.path.relpath(str((Path(cwd) / path).resolve()), cwd)
+                for path in (job.get("files") or []) + (job.get("shared_files") or [])] if cwd else []
+    job["scope"] = scope_report(job["changed_files"], declared,
+                                 protected_scope_paths(job, running) if cwd else [],
+                                 job.get("scope_policy", "strict"))
 
 
 def reclaim(root):
@@ -305,6 +349,15 @@ def reclaim(root):
                 job["outcome_reason"] = "missing_conclusion"
         if hits:
             job["block_reasons"] = hits
+        if status == "blocked" and job["conclusion"]:
+            try:
+                text = Path(job["conclusion"]).read_text(errors="replace")
+            except OSError:
+                text = ""
+            job["need_files"] = list(dict.fromkeys(
+                path.strip() for line in text.splitlines() if line.strip().startswith("NEED_FILES:")
+                for path in line.strip()[len("NEED_FILES:"):].split(",") if path.strip()))
+        completion_scope(job, load_jobs(root, "running"))
         job["finished_at"] = datetime.now(TZ).isoformat()
         write_job(root, "done", job)
         remove_job(root, "running", job["id"])

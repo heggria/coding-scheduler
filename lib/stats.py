@@ -45,6 +45,8 @@ def conclusion_text(job):
 def blocked_class(job, text):
     if job.get("status") != "blocked":
         return None
+    if job.get("need_files"):
+        return "files_narrow"
     text = (text + "\n" + str(job.get("block_reasons", ""))).lower()
     # Explicit causes take precedence over mentions of already delivered artifacts.
     if re.search(r"read.only|只读|不能写|不可写", text) and (

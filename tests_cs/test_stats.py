@@ -85,6 +85,9 @@ class StatsTests(unittest.TestCase):
         self.assertEqual(before, {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()})
 
     def test_heuristics_prompt_size_and_exact_done(self):
+        self.assertEqual(blocked_class(self.job(status="blocked", need_files=["extra.py"]),
+                                       "read-only cannot write output"), "files_narrow")
+        self.assertIsNone(blocked_class(self.job(status="done", need_files=["extra.py"]), ""))
         conclusion = Path(self.temp.name) / "conclusion.md"
         prompt = Path(self.temp.name) / "prompt.md"
         prompt.write_text("中文 prompt")

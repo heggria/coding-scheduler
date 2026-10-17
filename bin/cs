@@ -17,6 +17,7 @@ LIB = Path(__file__).resolve().parents[1] / "lib"
 sys.path.insert(0, str(LIB))
 
 from locks import directory_locks, lock_context
+from scope import narrow_warnings, policy_text
 import core
 from core import (TZ, check_queue, counts, doctor_checks, ensure, find_job, home,
                   job_summary, kill_worker_group, load_jobs, reason_text, reclaim, remove_job,
@@ -81,6 +82,8 @@ def cmd_submit(args):
         body = sys.stdin.read()
     else:
         body = Path(args.prompt).expanduser().read_text()
+    user_prompt = body
+    protected = core.protected_scope_paths({"id": jid, "cwd": str(cwd)}, load_jobs(root, "running"))
     declaration = "\n".join([
         '## 本单声明',
         '- cwd: ' + str(cwd),
@@ -88,6 +91,8 @@ def cmd_submit(args):
         '- shared 锁文件 (shared_files): ' + (json.dumps(shared_files, ensure_ascii=False) if shared_files else '无'),
         '- area: ' + args.area,
         '- read-only: ' + ('是' if args.read_only else '否'),
+        '',
+        policy_text(args.scope_policy, protected),
     ])
     body = declaration + "\n\n" + body
     template = root / "projects" / (args.project + ".md")
@@ -104,13 +109,21 @@ def cmd_submit(args):
         "created_at": datetime.now(TZ).isoformat(), "status": "queued",
         "pool": None, "affinity": {}, "pid": None, "conclusion": None, "exit": None,
         "idempotency_key": args.idempotency_key, "model": args.model,
+        "requested_model": args.model,
         "read_only": args.read_only,
+        "scope_policy": args.scope_policy, "user_prompt": user_prompt,
+        "no_template": args.no_template,
+        "warnings": narrow_warnings(files),
     }
+    if getattr(args, "retry_of", None):
+        job["retry_of"] = args.retry_of
     if args.review_of:
         job["review_of"] = args.review_of
     job["lock_ctx"] = lock_context(job)
     for path in directory_locks(job["lock_ctx"]):
         print("WARNING: directory lock %r covers all descendant paths" % path, file=sys.stderr)
+    for warning in job["warnings"]:
+        print("WARNING: " + warning, file=sys.stderr)
     pool = check_queue(root, job, load_jobs(root, "running"))
     try:
         core.validate_model(pool, args.model)
@@ -128,13 +141,40 @@ def cmd_submit(args):
 
 def submitted(args, job, existing=False):
     if args.json:
-        result = {"id": job["id"], "existing": existing, "job": job_summary(job)}
+        result = {"id": job["id"], "existing": existing, "job": job_summary(job),
+                  "warnings": job.get("warnings", [])}
         emit(result)
     else:
         print(job["id"])
         if job.get("status") == "queued":
             print(reason_text(job.get("queue_reasons", [])))
     return 0
+
+
+def cmd_retry(args):
+    original = find_job(ensure(), args.id)
+    if original is None:
+        return error(args, "not found: " + args.id, 1)
+    if original.get("status") in ("queued", "running"):
+        return error(args, "cannot retry a queued/running job: " + args.id)
+    if "user_prompt" not in original:
+        return error(args, "original raw user prompt unavailable; submit a new job explicitly")
+    def merge(paths, added):
+        return list(dict.fromkeys(paths + [p.strip() for p in added.split(",") if p.strip()]))
+    files = merge(original.get("files") or [], args.add_files)
+    if args.use_need_files:
+        files = list(dict.fromkeys(files + (original.get("need_files") or [])))
+    # launch replaces model with the effective model; preserve the user's choice.
+    submit_args = argparse.Namespace(
+        project=original["project"], area=original["area"], tier=original["tier"],
+        cwd=original["cwd"], risk=original.get("risk", "low"), pin=original.get("pin"),
+        model=original.get("requested_model", original.get("model")), read_only=original.get("read_only", False),
+        files=",".join(files), lock_shared=",".join(merge(original.get("shared_files") or [], args.add_shared)),
+        prompt_text=original["user_prompt"], prompt=None, no_template=original.get("no_template", False),
+        scope_policy=args.scope_policy or original.get("scope_policy", "strict"),
+        id=None, review_of=original.get("review_of"), retry_of=original["id"],
+        idempotency_key=args.idempotency_key, tick=args.tick, json=args.json)
+    return cmd_submit(submit_args)
 
 
 def cmd_tick(args):
@@ -298,11 +338,22 @@ def main():
     s.add_argument("--risk", choices=["low", "high"], default="low")
     s.add_argument("--files", default="", help="comma-separated exact output/writable file paths, including review docs; empty only with --area research --read-only (directory paths warn)")
     s.add_argument("--lock-shared", default="", help="comma-separated exact resource paths")
+    s.add_argument("--scope-policy", choices=["strict", "companion", "flex"], default="companion")
     s.add_argument("--id", type=identifier, default=None)
     s.add_argument("--review-of", choices=["codex", "cc"], default=None)
     s.add_argument("--read-only", action="store_true", help="conclusion does not require code delivery; empty --files only with --area research")
     s.add_argument("--tick", action="store_true")
     s.set_defaults(func=cmd_submit)
+
+    r = sp.add_parser("retry", help="clone a terminal job with an expanded declaration")
+    r.add_argument("id", type=identifier)
+    r.add_argument("--add-files", default="")
+    r.add_argument("--add-shared", default="")
+    r.add_argument("--use-need-files", action="store_true")
+    r.add_argument("--scope-policy", choices=["strict", "companion", "flex"], default=None)
+    r.add_argument("--idempotency-key", default=None)
+    r.add_argument("--tick", action="store_true")
+    r.set_defaults(func=cmd_retry)
 
     t = sp.add_parser("tick", help="reclaim finished + start free slots")
     t.set_defaults(func=cmd_tick)
@@ -337,7 +388,7 @@ def main():
     dashboard.add_argument("--host", default="127.0.0.1")
     dashboard.add_argument("--port", type=int, default=8787)
     dashboard.set_defaults(func=cmd_dashboard)
-    for parser in (s, t, st, w, c, b, d, stats):
+    for parser in (s, r, t, st, w, c, b, d, stats):
         parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     args = ap.parse_args()
     try:

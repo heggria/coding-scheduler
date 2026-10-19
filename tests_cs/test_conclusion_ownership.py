@@ -139,6 +139,12 @@ class ConclusionOwnershipTests(unittest.TestCase):
         changes = core.reclassify(self.root, "codex", since_s=3600, apply=True)
         self.assertEqual(changes[0]["after_reason"], "signaled")
         self.assertEqual(core.find_job(self.root, "old-kill")["failure_reason"], "signaled")
+        job = dict(id="old-503", cwd=str(self.cwd), files=[], status="failed", pool="cc", exit=1,
+                   failure_reason="upstream_transient", finished_at=core.datetime.now(core.TZ).isoformat())
+        core.write_job(self.root, "done", job)
+        (core.remote_dir("old-503")).mkdir(parents=True)
+        (core.remote_dir("old-503") / "conclusion.md").write_text("API Error: 503 Service Unavailable\n")
+        self.assertEqual(core.reclassify(self.root, "cc", since_s=3600), [])
 
     def test_cc_credit_exhaustion_pauses_cc_pool_and_503_still_retries(self):
         for jid, body in (("cc-credit", "API Error: Request rejected (429) · murmurant: The member's "

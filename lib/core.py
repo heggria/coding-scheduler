@@ -770,7 +770,11 @@ def reclassify(root, pool="opencode", since_s=None, apply=False, now=None, windo
         conclusion = remote_dir(job["id"]) / "conclusion.md"
         if not trial.get("conclusion") and conclusion.exists():
             trial["conclusion"] = str(conclusion)
-        judge_outcome(root, trial, idle_timeout=idle, live=False)
+        status, _, text = judge_outcome(root, trial, idle_timeout=idle, live=False)
+        # Same label reclaim applies (without queueing another retry).
+        if (status == "failed" and not idle and trial.get("failure_reason") in (None, "opencode_error")
+                and upstream_transient(text)):
+            trial["failure_reason"] = "upstream_transient"
         trials.append((job, trial, finished))
     quota = [(finished.timestamp(), trial) for _, trial, finished in trials
              if finished and trial.get("failure_reason") == "rate_limit"]

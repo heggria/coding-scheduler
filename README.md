@@ -177,7 +177,7 @@ Codex/CC/OpenCode 并发上限默认 24/6/32，运行时读取 `{CS_HOME}/caps.j
 `--pin opencode` 只等待此池，`--pin codex|cc` 保持旧逻辑；OpenCode 不参与 spill。
 默认模型 `opencode-go/deepseek-v4.1-flash`，variant 固定 `max`（2.x CLI 以 `model#max` 传入）；此池为订阅，豁免 quota.json 门禁。
 JSONL text parts 提取为外部 conclusion.md，原始事件留在 worker 的 output.jsonl / log。
-opencode 非零退出时 run.sh 仍提取结论（worker 已自写 conclusion.md 则不覆盖），并保留原退出码。
+opencode 非零退出时 run.sh 仍把 text parts 提取到 last-message.md，并保留原退出码（结论归属见下文）。
 
 **空闲判定**：reclaim/tick 检查 OpenCode 的 log 与 output.jsonl 的 mtime/size，并采样 worker 进程树
 （run.sh 及全部后代）的 CPU。输出与 CPU（占用 ≥ `CS_OPENCODE_CPU_ACTIVE_RATIO`，默认 0.05 核）都静默
@@ -224,6 +224,18 @@ worker prompt 仍会添加禁止子 agent 的硬规则。
 最终结论统一在外部 worker 目录 `~/.remote-jobs/<id>/conclusion.md`，隔离时为
 `<状态根>/workers/<id>/conclusion.md`；prompt 中明确禁止在仓库创建、暂存、提交
 `conclusion*.md`，根目录同名文件也由 `.gitignore` 排除。旧 worker 的 conclusion.txt 仍可回收。
+
+**结论归属**：三个池的 CLI 都把最后一条消息写到同目录的 `last-message.md`（codex `-o`、claude stdout、
+OpenCode text parts）。worker 按 prompt 自己写的 conclusion.md 不再被覆盖；worker 没写时才用最后一条消息补上。
+过去 `codex exec -o conclusion.md` / `claude -p > conclusion.md` 会在退出时用简短摘要覆盖完整结论，
+丢失 `NEED_FILES` / `OUT_OF_SCOPE_FILES`，导致 `cs retry --use-need-files` 失效。两份文件的最后 STATUS
+不一致时记 `conclusion_status_mismatch` 警告（以 conclusion.md 为准）；`cs status ID --json` 的 artifacts 带 `last_message`。
+
+**外部终止**：退出码 129–159（被信号杀死，非 cs cancel、非空闲超时）记 failure_reason `signaled`，不自动重试。
+
+**CC 额度**：`claude -p` 整个输出为 `API Error: ... (429)` / “credit is used up” 时记 rate_limit，并按同样的
+`pool_pause.json` 规则暂停 cc 池（时长同 `CS_OPENCODE_QUOTA_PAUSE_S`）：`--pin cc` 排队，未 pin 任务按亲和度改走 codex；
+503 等仍走 upstream_transient 自动重试一次。`cs reclassify --pool codex|cc|opencode` 可重放历史。
 
 目前无远程 quota 探测。可选 `<状态根>/quota.json` 为池级本地快照，例如：
 

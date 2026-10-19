@@ -424,7 +424,7 @@ def main():
     pool.add_argument("--resume", choices=["codex", "cc", "opencode"], default=None)
     pool.set_defaults(func=cmd_pool)
     rc = sp.add_parser("reclassify", help="replay outcome judgement on failed records (dry-run unless --apply)")
-    rc.add_argument("--pool", choices=["opencode"], default="opencode")
+    rc.add_argument("--pool", choices=["codex", "cc", "opencode"], default="opencode")
     rc.add_argument("--since", default="24h", help="duration (24h/1d) or ISO timestamp; empty for all")
     rc.add_argument("--apply", action="store_true")
     rc.set_defaults(func=cmd_reclassify)

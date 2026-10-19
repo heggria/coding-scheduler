@@ -294,6 +294,8 @@ def job_summary(job, lines=20):
                             "worktree": job.get("cwd")},
               "queue_reasons": job.get("queue_reasons", []),
               "last_checked": job.get("last_checked")}
+    if (jd / "last-message.md").is_file():
+        result["artifacts"]["last_message"] = str(jd / "last-message.md")
     for field in ("pgid", "cancel_killed_pids", "cancel_signal", "scope_policy", "scope",
                   "changed_files", "need_files", "retry_of", "retried_as", "raw_status", "warnings",
                   "failure_reason", "failure_detail", "retry_error", "last_queue_reasons", "queue_wait_s"):
@@ -668,6 +670,8 @@ def judge_outcome(root, job, idle_timeout=False, live=True):
             if events is None:
                 events, raw = opencode_stream(job)
             reason, detail, text = opencode_failure_from_stream(events, raw)
+            if signaled(job) and reason in SYMPTOM_REASONS:
+                reason, detail = "signaled", signal_detail(job)
             if reason:
                 if not idle_timeout:
                     job["failure_reason"] = reason
@@ -682,7 +686,66 @@ def judge_outcome(root, job, idle_timeout=False, live=True):
                     attribute_quota(job, entry)
         else:
             text = failure_text(job)
+            api_error = cc_api_error(job) if job.get("pool") == "cc" else None
+            if status == "failed" and api_error:
+                reason, detail = opencode_failure(api_error)
+                if reason is None and re.search(r"credit is used up|usage limit|quota", api_error, re.I):
+                    reason, detail = "rate_limit", api_error[:240]
+                if reason:
+                    job["failure_reason"], job["failure_detail"] = reason, detail
+                if reason == "rate_limit" and live:
+                    arm_pool_pause(root, "cc", job["id"], detail)
+            if status == "failed" and signaled(job) and not job.get("failure_reason"):
+                job["failure_reason"], job["failure_detail"] = "signaled", signal_detail(job)
+    status_mismatch(job)
     return status, hits, text
+
+
+def cc_api_error(job):
+    """`claude -p` prints a bare 'API Error: ...' as its whole output when the request fails."""
+    jd = remote_dir(job["id"])
+    for path in (jd / "last-message.md", Path(job["conclusion"]) if job.get("conclusion") else None):
+        try:
+            text = path.read_text(errors="replace").strip() if path else ""
+        except OSError:
+            continue
+        if text.startswith("API Error"):
+            return text[:1000]
+    return None
+
+
+def signaled(job):
+    """128+N exit: the worker was killed from outside (not cs cancel, not idle timeout)."""
+    code = job.get("exit")
+    return isinstance(code, int) and 128 < code < 160
+
+
+def signal_detail(job):
+    number = job["exit"] - 128
+    try:
+        name = signal.Signals(number).name
+    except ValueError:
+        name = "signal %d" % number
+    return "worker terminated by %s (exit %s); not a task failure" % (name, job["exit"])
+
+
+def last_status(path):
+    try:
+        found = re.findall(r"^\s*STATUS:\s*(DONE|BLOCKED)\s*$", Path(path).read_text(errors="replace"), re.M)
+    except (OSError, TypeError):
+        return None
+    return found[-1] if found else None
+
+
+def status_mismatch(job):
+    """Worker-written conclusion wins; flag when the final message disagrees."""
+    if not job.get("conclusion"):
+        return
+    final = last_status(Path(job["conclusion"]).with_name("last-message.md"))
+    written = last_status(job["conclusion"])
+    if final and written and final != written:
+        warning = "conclusion_status_mismatch: conclusion.md=%s, final message=%s" % (written, final)
+        job["warnings"] = list(dict.fromkeys((job.get("warnings") or []) + [warning]))
 
 
 def reclassify(root, pool="opencode", since_s=None, apply=False, now=None, window_s=600):
@@ -883,6 +946,7 @@ def launch(root, job, pool):
     exit_file.unlink(missing_ok=True)
     conclusion.unlink(missing_ok=True)
     (jd / "conclusion.txt").unlink(missing_ok=True)
+    (jd / "last-message.md").unlink(missing_ok=True)
     base_sha = git_output(cwd, "rev-parse", "HEAD")
     job.update(pool=pool, model=model, effort=effort, base_sha=base_sha,
                started_at=datetime.now(TZ).isoformat(), conclusion=str(conclusion), log=str(log))
@@ -901,11 +965,15 @@ def launch(root, job, pool):
         job.update(status="running", pid=None, pgid=None)
     else:
         q = shlex.quote
+        # Every pool writes its final message to last-message.md. A conclusion.md the
+        # worker wrote itself (as the prompt instructs) is never overwritten; the final
+        # message only fills in when the worker wrote none. The worker exit code is kept.
+        last = jd / "last-message.md"
         if pool == "codex":
             command = ("codex exec --dangerously-bypass-approvals-and-sandbox -m %s "
-                       "-c %s -C %s -o %s - < %s" %
+                       "-c %s -C %s -o %s - < %s || w_rc=$?\n" %
                        (q(model), q("model_reasoning_effort=" + effort), q(cwd),
-                        q(str(conclusion)), q(str(prompt_on_disk))))
+                        q(str(last)), q(str(prompt_on_disk))))
         elif pool == "opencode":
             events = jd / "output.jsonl"
             # Read the prompt from disk, and keep stdout JSONL separate from stderr.
@@ -913,22 +981,21 @@ def launch(root, job, pool):
                        "from core import extract_opencode_text; "
                        "extract_opencode_text(sys.argv[1], sys.argv[2])" % str(Path(__file__).resolve().parent))
             # OpenCode 2.x: variant is part of the model id; run.sh already cd's into cwd.
-            # A nonzero exit (often after self-recovered stream errors) still extracts
-            # the conclusion unless the worker already wrote one; the exit code is kept.
-            command = ("oc_rc=0\n"
-                       "opencode run -m %s --auto --format json "
-                       '\"$(cat %s)\" | tee %s || oc_rc=$?\n'
-                       'if [ "$oc_rc" -eq 0 ] || [ ! -s %s ]; then\n'
-                       "  /usr/bin/python3 -c %s %s %s || { ex=$?; [ \"$oc_rc\" -ne 0 ] || oc_rc=$ex; }\n"
-                       "fi\n"
-                       'exit "$oc_rc"' %
-                       (q(model + "#max"), q(str(prompt_on_disk)), q(str(events)), q(str(conclusion)),
-                        q(extract), q(str(events)), q(str(conclusion))))
+            # Extract even after a nonzero exit (often after self-recovered stream errors).
+            command = ("opencode run -m %s --auto --format json "
+                       '\"$(cat %s)\" | tee %s || w_rc=$?\n'
+                       "/usr/bin/python3 -c %s %s %s || { ex=$?; [ \"$w_rc\" -ne 0 ] || w_rc=$ex; }\n" %
+                       (q(model + "#max"), q(str(prompt_on_disk)), q(str(events)),
+                        q(extract), q(str(events)), q(str(last))))
         else:
             cc_effort = "high" if effort == "medium" else effort
             command = ("claude -p --dangerously-skip-permissions --model %s --effort %s "
-                       '\"$(cat %s)\" > %s' %
-                       (q(model), q(cc_effort), q(str(prompt_on_disk)), q(str(conclusion))))
+                       '\"$(cat %s)\" > %s || w_rc=$?\n' %
+                       (q(model), q(cc_effort), q(str(prompt_on_disk)), q(str(last))))
+        command = ("w_rc=0\n" + command +
+                   "if [ ! -s %s ] && [ -s %s ]; then cp %s %s; fi\n" % (
+                       q(str(conclusion)), q(str(last)), q(str(last)), q(str(conclusion))) +
+                   'exit "$w_rc"')
         run_sh = jd / "run.sh"
         # EXIT trap records nonzero command/cd failures too (old set -e lost them).
         trap = ('rc=$?; printf "%s\\n" "$rc" > ' + q(str(exit_file) + ".tmp") +
@@ -1020,7 +1087,13 @@ def check_queue(root, job, running, resolver=None):
           and c["opencode"] < OPENCODE_CAP):
         pool, reasons, eligible = "opencode", [], ["opencode"]
     else:
-        pool, reasons = pick_pool(cs, ccs, CODEX_CAP - c["codex"], CC_CAP - c["cc"])
+        # A quota-paused pool has no free slots; its pin waits with a pool_paused reason.
+        held = {name: pool_pause(root, name) for name in ("codex", "cc")}
+        pool, reasons = pick_pool(cs, ccs, 0 if held["codex"] else CODEX_CAP - c["codex"],
+                                  0 if held["cc"] else CC_CAP - c["cc"])
+        reasons = [{"type": "pool_paused", "pool": item["pool"], "until": held[item["pool"]]["until"]}
+                   if item.get("type") == "pool_full" and held.get(item["pool"]) else item
+                   for item in reasons]
         primary = "codex" if cs >= ccs else "cc"
         secondary = "cc" if primary == "codex" else "codex"
         eligible = [pool] if pool else [primary] + ([secondary] if job["affinity"][secondary] >= 45 else [])

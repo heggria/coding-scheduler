@@ -363,7 +363,7 @@ def delivered(text):
     return False
 
 
-def opencode_idle(job, now):
+def opencode_idle(job, now, sample_cpu=True):
     """Persist both files' mtime/size, including same-size rewrites and deletion."""
     jd = remote_dir(job["id"])
     signature, mtimes = [], []
@@ -381,13 +381,71 @@ def opencode_idle(job, now):
                    for previous, current in zip(job["output_signature"], signature) if previous != current]
         last = max([last] + changes)
     job.update(output_signature=signature, output_changed_at=last)
+    threshold = env_seconds("CS_OPENCODE_IDLE_S", 600)
+    # A silent tool command (tests, builds) keeps the worker tree busy: CPU use
+    # since the previous sample counts as activity, bounded by a hard cap.
+    if sample_cpu and job.get("pid"):
+        cpu = process_tree_cpu(job["pid"])
+        if cpu is not None:
+            previous, previous_at = job.get("tree_cpu"), job.get("tree_cpu_at")
+            if (previous is not None and previous_at is not None and now > previous_at
+                    and (cpu - previous) / (now - previous_at) >= env_ratio("CS_OPENCODE_CPU_ACTIVE_RATIO", 0.05)):
+                job["cpu_active_at"] = now
+            job.update(tree_cpu=cpu, tree_cpu_at=now)
+    active = max(last, job.get("cpu_active_at") or 0)
+    if now - last >= max(threshold, env_seconds("CS_OPENCODE_MAX_SILENT_S", 5400)):
+        return True
+    return now - active >= threshold
+
+
+def env_seconds(name, default):
     try:
-        threshold = float(os.environ.get("CS_OPENCODE_IDLE_S", "600"))
-        if not math.isfinite(threshold) or threshold <= 0:
-            threshold = 600
+        value = float(os.environ.get(name, default))
     except ValueError:
-        threshold = 600
-    return now - last >= threshold
+        return default
+    return value if math.isfinite(value) and value > 0 else default
+
+
+def env_ratio(name, default):
+    value = env_seconds(name, default)
+    return value if value <= 1 else default
+
+
+def parse_cputime(text):
+    """ps TIME: [[dd-]hh:]mm:ss[.xx] -> seconds."""
+    days, _, rest = text.strip().rpartition("-")
+    seconds = 0.0
+    for part in rest.split(":"):
+        seconds = seconds * 60 + float(part)
+    return seconds + (int(days) * 86400 if days else 0)
+
+
+def process_tree_cpu(pid):
+    """Total CPU seconds of pid and its live descendants; None when unknown."""
+    try:
+        result = subprocess.run(["ps", "-axo", "pid=,ppid=,time="], capture_output=True,
+                                text=True, check=True, timeout=5)
+        rows = {}
+        for line in result.stdout.splitlines():
+            child, parent, cputime = line.split()
+            rows[int(child)] = (int(parent), parse_cputime(cputime))
+    except Exception:  # Sampling is advisory; never break reclaim/launch.
+        return None
+    pid = int(pid)
+    if pid not in rows:
+        return None
+    children = {}
+    for child, (parent, _) in rows.items():
+        children.setdefault(parent, []).append(child)
+    total, stack, seen = 0.0, [pid], set()
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        total += rows[current][1]
+        stack.extend(children.get(current, []))
+    return total
 
 
 def failure_text(job):
@@ -416,6 +474,261 @@ def opencode_failure(text):
         if match:
             return reason, " ".join(text[max(0, match.start() - 40):match.end() + 160].split())[:240]
     return None, None
+
+
+# OpenCode retries these itself; they still make `opencode run` exit nonzero.
+RECOVERABLE_OPENCODE_ERRORS = ("provider.invalid-output",)
+# Reasons that only describe how the worker stopped, not why.
+SYMPTOM_REASONS = (None, "opencode_error", "stream_truncated", "abrupt_exit")
+STATUS_LINE = re.compile(r"^\s*STATUS:\s*(?:DONE|BLOCKED)\s*$", re.M)
+STREAM_TAIL_BYTES = 16 * 1024 * 1024
+
+
+def _tail_lines(path):
+    with path.open("rb") as handle:
+        handle.seek(max(0, path.stat().st_size - STREAM_TAIL_BYTES))
+        return handle.read().decode("utf-8", errors="replace").splitlines()
+
+
+def opencode_stream(job):
+    """(events, raw): JSON events (output.jsonl, else log) and non-JSON lines (stderr)."""
+    jd = remote_dir(job["id"])
+    events, raw = [], []
+    for path in (jd / "output.jsonl", Path(job.get("log") or jd / "log")):
+        found = []
+        try:
+            lines = _tail_lines(path)
+        except OSError:
+            continue
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                event = None
+            if isinstance(event, dict) and "type" in event:
+                found.append(event)
+            elif line not in raw:
+                raw.append(line)
+        if not events:
+            events = found
+    return events, raw
+
+
+def opencode_error_type(event):
+    error = event.get("error")
+    if isinstance(error, dict):
+        return error.get("type") or error.get("name")
+    return None
+
+
+def final_turn(event):
+    """A clean stop, or a closing text whose stream was cut before finish (no tool call pending)."""
+    part = event.get("part") if isinstance(event.get("part"), dict) else {}
+    return ((event.get("type") == "step_finish" and part.get("reason") == "stop")
+            or event.get("type") == "text")
+
+
+def opencode_recovered(job, events):
+    """Errors seen, all self-recovered; final turn completed and conclusion has a STATUS line."""
+    errors = [event for event in events if event.get("type") == "error"]
+    if not errors or any(opencode_error_type(event) not in RECOVERABLE_OPENCODE_ERRORS for event in errors):
+        return None
+    rest = [event for event in events if event.get("type") != "error"]
+    if not rest:
+        return None
+    last = rest[-1]
+    if not final_turn(last):
+        return None
+    try:
+        conclusion = Path(job["conclusion"]).read_text(errors="replace") if job.get("conclusion") else ""
+    except OSError:
+        return None
+    return len(errors) if STATUS_LINE.search(conclusion) else None
+
+
+def opencode_failure_from_stream(events, raw):
+    """Classify from error events and stderr only, never from conclusions or task prose."""
+    errors = [event for event in events if event.get("type") == "error"]
+    text = "\n".join([json.dumps(event, ensure_ascii=False) for event in errors] + raw)
+    reason, detail = opencode_failure(text)
+    if reason not in SYMPTOM_REASONS:
+        return reason, detail, text
+    rest = [event for event in events if event.get("type") != "error"]
+    last = events[-1] if events else None
+    if last is not None and last.get("type") != "error" and rest and not final_turn(rest[-1]):
+        part = rest[-1].get("part") if isinstance(rest[-1].get("part"), dict) else {}
+        return "abrupt_exit", "worker exited mid-turn after %s%s event (%d earlier error event(s))" % (
+            rest[-1]["type"], "(%s)" % part["reason"] if part.get("reason") else "", len(errors)), text
+    if errors and all(opencode_error_type(event) in RECOVERABLE_OPENCODE_ERRORS for event in errors):
+        return "stream_truncated", detail, text
+    return reason, detail, text
+
+
+POOL_PAUSE_FILE = "pool_pause.json"
+PAUSE_STRIKE_WINDOW_S = 2 * 3600
+PAUSE_MAX_S = 5 * 3600
+
+
+def load_pauses(root):
+    try:
+        data = json.loads((root / POOL_PAUSE_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_pauses(root, pauses):
+    path = root / POOL_PAUSE_FILE
+    if not pauses:
+        path.unlink(missing_ok=True)
+        return
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(pauses, ensure_ascii=False, indent=2) + "\n")
+    temporary.replace(path)
+
+
+def pool_pause(root, pool, now=None):
+    """Active pause entry for pool, else None."""
+    entry = load_pauses(root).get(pool)
+    until = timestamp(entry.get("until")) if isinstance(entry, dict) else None
+    now = now if now is not None else time.time()
+    return entry if until and until.timestamp() > now else None
+
+
+def arm_pool_pause(root, pool, job_id, detail, now=None):
+    """Pause pool after real quota evidence; escalate only when a post-pause probe fails."""
+    now = now if now is not None else time.time()
+    pauses = load_pauses(root)
+    previous = pauses.get(pool) if isinstance(pauses.get(pool), dict) else None
+    previous_until = timestamp(previous.get("until")) if previous else None
+    if previous_until and previous_until.timestamp() > now:
+        return previous, False
+    strikes = 1
+    if previous_until and now - previous_until.timestamp() < PAUSE_STRIKE_WINDOW_S:
+        strikes = int(previous.get("strikes") or 1) + 1
+    seconds = min(PAUSE_MAX_S, env_seconds("CS_OPENCODE_QUOTA_PAUSE_S", 1800) * 2 ** (strikes - 1))
+    entry = {"since": datetime.fromtimestamp(now, TZ).isoformat(),
+             "until": datetime.fromtimestamp(now + seconds, TZ).isoformat(),
+             "strikes": strikes, "job": job_id, "detail": (detail or "")[:240]}
+    pauses[pool] = entry
+    save_pauses(root, pauses)
+    return entry, True
+
+
+def clear_pool_pause(root, pool):
+    pauses = load_pauses(root)
+    removed = pauses.pop(pool, None)
+    save_pauses(root, pauses)
+    return removed
+
+
+def attribute_quota(job, entry):
+    job.update(failure_reason="rate_limit", quota_attributed=True,
+               failure_detail="attributed to %s pool quota exhaustion since %s (evidence job %s); own symptom: %s" % (
+                   job.get("pool"), entry["since"], entry["job"], job.get("failure_reason")))
+
+
+def attribute_recent_quota_failures(root, entry, window_s=600):
+    """Same-burst abrupt OpenCode exits reclaimed before the quota evidence."""
+    since = timestamp(entry["since"]).timestamp()
+    changed = []
+    for job in load_jobs(root, "done"):
+        finished = timestamp(job.get("finished_at"))
+        if (job.get("pool") == "opencode" and job.get("status") == "failed"
+                and job.get("failure_reason") in SYMPTOM_REASONS[1:] and finished
+                and since - window_s <= finished.timestamp() <= since + window_s):
+            attribute_quota(job, entry)
+            write_job(root, "done", job)
+            changed.append(job["id"])
+    return changed
+
+
+def judge_outcome(root, job, idle_timeout=False, live=True):
+    """Set status/failure fields from exit + evidence; returns (status, hits, failure text)."""
+    job.setdefault("conclusion", None)
+    status, hits = classify_outcome(job["exit"], job["conclusion"], job)
+    text = ""
+    events = raw = None
+    if job.get("pool") == "opencode" and status == "failed" and not idle_timeout:
+        events, raw = opencode_stream(job)
+        recovered = opencode_recovered(job, events)
+        if recovered is not None:
+            status, hits = classify_outcome(0, job["conclusion"], job)
+            job["recovered_exit"] = job["exit"]
+            warning = ("opencode_nonzero_exit_recovered: exit=%s after %d self-recovered %s event(s); "
+                       "final turn completed with a STATUS line" % (
+                           job["exit"], recovered, "/".join(RECOVERABLE_OPENCODE_ERRORS)))
+            job["warnings"] = list(dict.fromkeys((job.get("warnings") or []) + [warning]))
+    job["status"] = status
+    if status == "failed" or job["exit"] == 124:
+        if job.get("pool") == "opencode":
+            if events is None:
+                events, raw = opencode_stream(job)
+            reason, detail, text = opencode_failure_from_stream(events, raw)
+            if reason:
+                if not idle_timeout:
+                    job["failure_reason"] = reason
+                job["failure_detail"] = detail
+            if live and reason == "rate_limit":
+                entry, armed = arm_pool_pause(root, "opencode", job["id"], detail)
+                if armed:
+                    attribute_recent_quota_failures(root, entry)
+            elif live and status == "failed" and job.get("failure_reason") in SYMPTOM_REASONS[1:]:
+                entry = pool_pause(root, "opencode")
+                if entry:
+                    attribute_quota(job, entry)
+        else:
+            text = failure_text(job)
+    return status, hits, text
+
+
+def reclassify(root, pool="opencode", since_s=None, apply=False, now=None, window_s=600):
+    """Replay outcome judgement on failed terminal records. Dry-run unless apply.
+
+    Never arms live pauses; quota attribution uses same-burst evidence from the replay itself.
+    """
+    now = now if now is not None else time.time()
+    trials = []
+    for job in load_jobs(root, "done"):
+        finished = timestamp(job.get("finished_at"))
+        if (job.get("pool") != pool or job.get("status") != "failed" or job.get("exit") is None
+                or job.get("reclassified_from")):
+            continue
+        if since_s is not None and (not finished or now - finished.timestamp() > since_s):
+            continue
+        idle = job.get("failure_reason") == "no_output_timeout"
+        trial = dict(job)
+        if not idle:
+            trial.pop("failure_reason", None)
+        trial.pop("failure_detail", None)
+        conclusion = remote_dir(job["id"]) / "conclusion.md"
+        if not trial.get("conclusion") and conclusion.exists():
+            trial["conclusion"] = str(conclusion)
+        judge_outcome(root, trial, idle_timeout=idle, live=False)
+        trials.append((job, trial, finished))
+    quota = [(finished.timestamp(), trial) for _, trial, finished in trials
+             if finished and trial.get("failure_reason") == "rate_limit"]
+    changes = []
+    for job, trial, finished in trials:
+        if trial["status"] == "failed" and trial.get("failure_reason") in SYMPTOM_REASONS[1:] and finished:
+            near = [(at, other) for at, other in quota if abs(at - finished.timestamp()) <= window_s]
+            if near:
+                other = min(near, key=lambda item: abs(item[0] - finished.timestamp()))[1]
+                attribute_quota(trial, {"since": other.get("finished_at"), "job": other["id"]})
+        before = {key: job.get(key) for key in ("status", "failure_reason", "failure_detail", "warnings")}
+        if (trial["status"], trial.get("failure_reason")) == (before["status"], before["failure_reason"]):
+            continue
+        changes.append({"id": job["id"], "key": job.get("idempotency_key"), "before": before["status"],
+                        "before_reason": before["failure_reason"], "after": trial["status"],
+                        "after_reason": trial.get("failure_reason")})
+        if apply:
+            trial["reclassified_from"] = dict(before, at=datetime.now(TZ).isoformat())
+            write_job(root, "done", trial)
+            log_event(root, trial)  # Same id + finished_at: stats prefer the latest line.
+    return changes
 
 
 def protected_scope_paths(job, running):
@@ -491,25 +804,15 @@ def reclaim(root):
         if not conc.exists():
             conc = conc.with_suffix(".txt")  # Already running legacy workers.
         job["conclusion"] = str(conc) if conc.exists() else None
-        status, hits = classify_outcome(job["exit"], job["conclusion"], job)
-        job["status"] = status
-        if status == "failed" or job["exit"] == 124:
-            text = failure_text(job)
-            reason = None
-            if job.get("pool") == "opencode":
-                reason, detail = opencode_failure(text)
-                if reason:
-                    if not idle_timeout:
-                        job["failure_reason"] = reason
-                    job["failure_detail"] = detail
-            if (status == "failed" and not idle_timeout and reason in (None, "opencode_error")
-                    and upstream_transient(text)):
-                job["failure_reason"] = "upstream_transient"
-                job["failure_detail"] = next((line.strip()[:240] for line in text.splitlines()
-                                              if upstream_transient(line)), "upstream transient error")
-                retried_as = retry_transient(root, job)
-                if retried_as:
-                    job["retried_as"] = retried_as
+        status, hits, text = judge_outcome(root, job, idle_timeout)
+        if (status == "failed" and not idle_timeout and job.get("failure_reason") in (None, "opencode_error")
+                and upstream_transient(text)):
+            job["failure_reason"] = "upstream_transient"
+            job["failure_detail"] = next((line.strip()[:240] for line in text.splitlines()
+                                          if upstream_transient(line)), "upstream transient error")
+            retried_as = retry_transient(root, job)
+            if retried_as:
+                job["retried_as"] = retried_as
         if status == "unknown":
             if job["exit"] == 124:
                 job["outcome_reason"] = "worker_timeout"
@@ -610,9 +913,16 @@ def launch(root, job, pool):
                        "from core import extract_opencode_text; "
                        "extract_opencode_text(sys.argv[1], sys.argv[2])" % str(Path(__file__).resolve().parent))
             # OpenCode 2.x: variant is part of the model id; run.sh already cd's into cwd.
-            command = ("opencode run -m %s --auto --format json "
-                       '\"$(cat %s)\" | tee %s\n/usr/bin/python3 -c %s %s %s' %
-                       (q(model + "#max"), q(str(prompt_on_disk)), q(str(events)),
+            # A nonzero exit (often after self-recovered stream errors) still extracts
+            # the conclusion unless the worker already wrote one; the exit code is kept.
+            command = ("oc_rc=0\n"
+                       "opencode run -m %s --auto --format json "
+                       '\"$(cat %s)\" | tee %s || oc_rc=$?\n'
+                       'if [ "$oc_rc" -eq 0 ] || [ ! -s %s ]; then\n'
+                       "  /usr/bin/python3 -c %s %s %s || { ex=$?; [ \"$oc_rc\" -ne 0 ] || oc_rc=$ex; }\n"
+                       "fi\n"
+                       'exit "$oc_rc"' %
+                       (q(model + "#max"), q(str(prompt_on_disk)), q(str(events)), q(str(conclusion)),
                         q(extract), q(str(events)), q(str(conclusion))))
         else:
             cc_effort = "high" if effort == "medium" else effort
@@ -635,7 +945,7 @@ def launch(root, job, pool):
         job.update(status="running", pid=proc.pid, pgid=proc.pid)
         (jd / "pid").write_text(str(proc.pid) + "\n")
     if pool == "opencode":
-        opencode_idle(job, time.time())
+        opencode_idle(job, time.time(), sample_cpu=False)
     write_job(root, "running", job)
     remove_job(root, "queue", job["id"])
     return job
@@ -696,12 +1006,17 @@ def check_queue(root, job, running, resolver=None):
     cs, ccs = score(job, c, area_counts(running))
     job["affinity"] = {"codex": cs, "cc": ccs}
     pin = job.get("pin")
-    if pin == "opencode":
+    paused = pool_pause(root, "opencode")
+    if pin == "opencode" and paused:
+        # Explicit pin waits out the quota pause instead of spilling.
+        pool, eligible = None, ["opencode"]
+        reasons = [{"type": "pool_paused", "pool": "opencode", "until": paused["until"]}]
+    elif pin == "opencode":
         pool = "opencode" if c["opencode"] < OPENCODE_CAP else None
         reasons = [] if pool else [{"type": "pool_full", "pool": "opencode",
                                    "free": OPENCODE_CAP - c["opencode"]}]
         eligible = ["opencode"]
-    elif (not pin and job.get("tier") == "L" and low_risk(job, resolver)
+    elif (not pin and not paused and job.get("tier") == "L" and low_risk(job, resolver)
           and c["opencode"] < OPENCODE_CAP):
         pool, reasons, eligible = "opencode", [], ["opencode"]
     else:
@@ -732,6 +1047,8 @@ def reason_text(reasons):
             text = "%s 额度未知" % reason["pool"]
         elif kind == "quota_exhausted":
             text = "%s 额度耗尽" % reason["pool"]
+        elif kind == "pool_paused":
+            text = "%s 额度暂停至 %s" % (reason["pool"], str(reason.get("until", ""))[11:16])
         elif kind == "awaiting_tick":
             text = "等待 tick 调度"
         elif kind == "launch_error":

@@ -211,6 +211,8 @@ def snapshot(status_command=None):
             timeline.append(job)
     return {"schema_version": "1", "counts": counts(folders["running"]),
             "caps": caps, "reclaimed": 0,
+            "paused": {pool: entry for pool in ("codex", "cc", "opencode")
+                       for entry in [core.pool_pause(root, pool)] if entry},
             "running": folders["running"], "queued": folders["queue"],
             "dashboard": {"running": running, "queued": queued, "done": recent,
                           "completed": completed, "timeline": timeline,

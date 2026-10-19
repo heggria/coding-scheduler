@@ -177,10 +177,31 @@ Codex/CC/OpenCode 并发上限默认 24/6/32，运行时读取 `{CS_HOME}/caps.j
 `--pin opencode` 只等待此池，`--pin codex|cc` 保持旧逻辑；OpenCode 不参与 spill。
 默认模型 `opencode-go/deepseek-v4.1-flash`，variant 固定 `max`（2.x CLI 以 `model#max` 传入）；此池为订阅，豁免 quota.json 门禁。
 JSONL text parts 提取为外部 conclusion.md，原始事件留在 worker 的 output.jsonl / log。
-reclaim/tick 检查 OpenCode 的 log 与 output.jsonl 的 mtime/size；从启动或最后变化起静默
-600 秒即清理进程组并记 failed / `no_output_timeout`，可用正数 `CS_OPENCODE_IDLE_S` 调整。
-非零退出或超时会扫描任务本地结论与两份日志尾部，记录 rate_limit、insufficient_funds、
-model_unavailable、auth 等 failure_reason 和简短 failure_detail；exit=124 仍为 unknown。
+opencode 非零退出时 run.sh 仍提取结论（worker 已自写 conclusion.md 则不覆盖），并保留原退出码。
+
+**空闲判定**：reclaim/tick 检查 OpenCode 的 log 与 output.jsonl 的 mtime/size，并采样 worker 进程树
+（run.sh 及全部后代）的 CPU。输出与 CPU（占用 ≥ `CS_OPENCODE_CPU_ACTIVE_RATIO`，默认 0.05 核）都静默
+`CS_OPENCODE_IDLE_S`（默认 600）秒，或仅输出静默达 `CS_OPENCODE_MAX_SILENT_S`（默认 5400）秒硬上限，
+才清理进程组并记 failed / `no_output_timeout`。跑长测试/构建的静默工具命令因此不再被误杀。
+
+**结果判定**：`opencode run` 只要会话中出现过错误事件就以 1 退出，即使已自行重试恢复。若错误全是可自愈的
+`provider.invalid-output`（流未带 finish_reason 截断）、最后一轮正常结束（`step_finish` stop，或截断前的收尾 text，
+其后无待执行工具调用），且结论含整行 `STATUS: DONE|BLOCKED`，按 exit=0 判定，记 `recovered_exit` 与
+`opencode_nonzero_exit_recovered` 警告；`exit` 保留真实值。
+
+**失败原因**只取自 JSON 错误事件与非 JSON 的 stderr 行，不再扫描结论、正文或工具输出（避免
+“forbidden ports”、`*-rate-limit.test.ts` 之类误判）：insufficient_funds、model_unavailable、auth、rate_limit（含
+`provider.quota` / 429）、`stream_truncated`（只有可自愈错误但未交付）、`abrupt_exit`（停在一轮中途：
+step_start / tool_use / step_finish tool-calls 后退出）、opencode_error；exit=124 仍为 unknown。
+
+**额度暂停**：出现真实额度证据（rate_limit）时写 `<状态根>/pool_pause.json` 暂停 opencode 池
+`CS_OPENCODE_QUOTA_PAUSE_S`（默认 1800）秒；暂停到期后的试探再失败则翻倍，上限 5 小时，2 小时内无复发重置。
+暂停期间 `--pin opencode` 排队（原因 `pool_paused`），未 pin 的 L 级任务改走 Codex/CC 亲和选池；
+同一波（±10 分钟）内 `abrupt_exit` / `stream_truncated` 的 OpenCode 失败归因为 rate_limit（`quota_attributed`）。
+`cs pool` 查看，`cs pool --resume opencode` 手动解除；`cs status --json` 与看板 `/api/state` 带 `paused`。
+
+**历史重判**：`cs reclassify [--since 24h] [--apply]` 用上述规则重放 OpenCode failed 记录，默认只预演；
+`--apply` 写回 done 记录（`reclassified_from` 保留原状态）并追加事件，使 `cs stats` 采用新结果。重放不触发暂停。
 
 可选真实冒烟命令（不属于自动测试；显式执行才调用真实模型）：
 

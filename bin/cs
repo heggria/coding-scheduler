@@ -204,12 +204,16 @@ def cmd_status(args):
     running, queued = load_jobs(root, "running"), load_jobs(root, "queue")
     c = counts(running)
     caps = core.reload_caps(root)
+    paused = {pool: entry for pool in ("codex", "cc", "opencode")
+              for entry in [core.pool_pause(root, pool)] if entry}
     if args.json:
-        emit({"counts": c, "caps": caps,
+        emit({"counts": c, "caps": caps, "paused": paused,
               "reclaimed": reclaimed, "running": running, "queued": queued})
     else:
         print("Codex %s/%s  CC %s/%s  OpenCode %s/%s" %
               (c["codex"], caps["codex"], c["cc"], caps["cc"], c["opencode"], caps["opencode"]))
+        for pool, entry in paused.items():
+            print("%s paused until %s: %s" % (pool, entry["until"], entry.get("detail", "")))
         print("running=%s queued=%s reclaimed=%s" % (len(running), len(queued), reclaimed))
         for job in running + queued:
             print("  [%s] %s tier=%s pool=%s area=%s %s" %
@@ -299,6 +303,41 @@ def cmd_dashboard(args):
     return serve(args, cmd_status)
 
 
+def cmd_pool(args):
+    root = ensure()
+    if args.resume:
+        removed = core.clear_pool_pause(root, args.resume)
+        result = {"resumed": args.resume, "removed": removed}
+    else:
+        result = {"pauses": core.load_pauses(root),
+                  "active": {pool: core.pool_pause(root, pool) for pool in ("codex", "cc", "opencode")
+                             if core.pool_pause(root, pool)}}
+    if args.json:
+        emit(result)
+    elif args.resume:
+        print("%s resumed%s" % (args.resume, "" if result["removed"] else " (was not paused)"))
+    else:
+        print("\n".join("%s paused until %s (strike %s, job %s): %s" % (
+            pool, entry["until"], entry.get("strikes"), entry.get("job"), entry.get("detail", ""))
+            for pool, entry in result["active"].items()) or "no active pool pause")
+    return 0
+
+
+def cmd_reclassify(args):
+    from stats import parse_since
+    root = ensure()
+    since_s = (datetime.now(TZ) - parse_since(args.since)).total_seconds() if args.since else None
+    changes = core.reclassify(root, args.pool, since_s, apply=args.apply)
+    if args.json:
+        emit({"applied": args.apply, "changes": changes})
+    else:
+        for change in changes:
+            print("%s %s(%s) -> %s(%s)" % (change["key"] or change["id"], change["before"],
+                  change["before_reason"], change["after"], change["after_reason"]))
+        print("%d change(s)%s" % (len(changes), " applied" if args.apply else " (dry-run; add --apply)"))
+    return 0
+
+
 def cmd_stats(args):
     from stats import collect_stats, format_stats
     result = collect_stats(home(), args.since, args.project, args.pool)
@@ -381,11 +420,19 @@ def main():
     stats.add_argument("--project", default=None)
     stats.add_argument("--pool", choices=["codex", "cc", "opencode"], default=None)
     stats.set_defaults(func=cmd_stats)
+    pool = sp.add_parser("pool", help="show pool quota pauses, or --resume one")
+    pool.add_argument("--resume", choices=["codex", "cc", "opencode"], default=None)
+    pool.set_defaults(func=cmd_pool)
+    rc = sp.add_parser("reclassify", help="replay outcome judgement on failed records (dry-run unless --apply)")
+    rc.add_argument("--pool", choices=["opencode"], default="opencode")
+    rc.add_argument("--since", default="24h", help="duration (24h/1d) or ISO timestamp; empty for all")
+    rc.add_argument("--apply", action="store_true")
+    rc.set_defaults(func=cmd_reclassify)
     dashboard = sp.add_parser("dashboard", help="serve the read-only live dashboard")
     dashboard.add_argument("--host", default="127.0.0.1")
     dashboard.add_argument("--port", type=int, default=8787)
     dashboard.set_defaults(func=cmd_dashboard)
-    for parser in (s, r, t, st, w, c, b, d, stats):
+    for parser in (s, r, t, st, w, c, b, d, stats, pool, rc):
         parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     args = ap.parse_args()
     try:

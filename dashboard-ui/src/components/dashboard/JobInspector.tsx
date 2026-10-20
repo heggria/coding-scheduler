@@ -299,7 +299,7 @@ export function JobInspector({
         )}
         {tab === "log" && (
           <>
-            <LogViewer id={j.id} running={row.bucket === "running"} fallback={j.log_last_line} />
+            <LogViewer id={j.id} running={row.kind === "running"} fallback={j.log_last_line} />
             <h5>日志路径</h5>
             <PathLine value={j.log} />
           </>

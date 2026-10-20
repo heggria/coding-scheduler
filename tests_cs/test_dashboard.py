@@ -66,6 +66,18 @@ class DashboardTests(unittest.TestCase):
         core.write_job(self.root, folder, job)
         return job
 
+    def test_paused_worker_snapshot_preserves_capacity_and_read_only_state(self):
+        self.record("stopped", "running", pid=101)
+        before = (self.root / "running/stopped.json").read_bytes()
+        with patch.object(core, "process_snapshot", return_value={101: (1, "S"), 102: (101, "T")}):
+            data = dashboard.snapshot()
+        self.assertEqual(data["running"][0]["status"], "paused")
+        self.assertEqual(data["dashboard"]["running"][0]["paused_pids"], [102])
+        self.assertEqual(data["counts"]["codex"], 1)
+        self.assertEqual((self.root / "running/stopped.json").read_bytes(), before)
+        with patch.object(core, "process_snapshot", return_value={101: (1, "S"), 102: (101, "S")}):
+            self.assertEqual(dashboard.snapshot()["dashboard"]["running"][0]["status"], "running")
+
     def test_http_page_api_and_status_contract(self):
         self.record("live", "running", pid=os.getpid(),
                     started_at=(self.now - timedelta(minutes=2)).isoformat())

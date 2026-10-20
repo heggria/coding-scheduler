@@ -5,6 +5,7 @@ import type { Bucket, Job, Pool, Reason, Row, State } from "@/types";
 export const POOLS: Pool[] = ["codex", "cc", "opencode"];
 export const STATUS_LABEL: Record<string, string> = {
   running: "运行中",
+  paused: "已暂停",
   queued: "排队中",
   done: "成功",
   failed: "失败",
@@ -59,7 +60,7 @@ export function dur(seconds?: number | null): string {
 }
 
 export function kindOf(job: Job, bucket: Bucket): string {
-  if (bucket === "running") return "running";
+  if (bucket === "running") return job.status === "paused" ? "paused" : "running";
   if (bucket === "queued") return "queued";
   const s = job.status || "";
   return TERMINAL.includes(s) ? s : "unknown";
@@ -67,7 +68,7 @@ export function kindOf(job: Job, bucket: Bucket): string {
 export const tone = (kind: string) =>
   kind === "running" || kind === "done"
     ? "ok"
-    : kind === "queued" || kind === "blocked"
+    : kind === "queued" || kind === "blocked" || kind === "paused"
       ? "warn"
       : kind === "cancelled"
         ? "mute"

@@ -62,6 +62,45 @@ class SchedulerTests(unittest.TestCase):
         core.write_job(self.root, folder, job)
         return job
 
+    def test_stopped_descendant_is_paused_without_releasing_job(self):
+        worker = subprocess.Popen([sys.executable, "-u", "-c",
+            "import os,signal,sys; os.kill(os.getpid(),signal.SIGSTOP); "
+            "print('resumed',flush=True); sys.stdin.read()"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        def cleanup():
+            if worker.poll() is None:
+                os.kill(worker.pid, signal.SIGCONT)
+                worker.terminate()
+            worker.wait(timeout=5)
+            worker.stdin.close()
+            worker.stdout.close()
+        self.addCleanup(cleanup)
+        _, state = os.waitpid(worker.pid, os.WUNTRACED)
+        self.assertTrue(os.WIFSTOPPED(state))
+        job = self.record("paused-worker", "running", status="running", pool="codex",
+                          pid=os.getpid(), files=["locked.py"])
+        raw = (self.root / "running/paused-worker.json").read_bytes()
+        data = json.loads(self.cli("status", "--no-reclaim", "--json"))
+        self.assertEqual(data["running"][0]["status"], "paused")
+        self.assertIn(worker.pid, data["running"][0]["paused_pids"])
+        self.assertEqual(data["counts"]["codex"], 1)
+        summary = json.loads(self.cli("status", job["id"], "--no-reclaim", "--json"))["job"]
+        self.assertEqual(summary["status"], "paused")
+        self.assertEqual((self.root / "running/paused-worker.json").read_bytes(), raw)
+        self.assertEqual(core.reclaim(self.root), 0)
+        self.assertEqual(core.load_jobs(self.root, "running")[0]["files"], ["locked.py"])
+        os.kill(worker.pid, signal.SIGCONT)
+        self.assertEqual(worker.stdout.readline().strip(), "resumed")
+        self.assertEqual(core.observe_running([job])[0]["status"], "running")
+
+    def test_process_probe_failure_and_invalid_pid_do_not_invent_pause(self):
+        jobs = [dict(id=str(pid), pid=pid, status="running") for pid in (None, -1, 0)]
+        with patch.object(core.subprocess, "run", side_effect=subprocess.TimeoutExpired("ps", 5)):
+            self.assertEqual(core.observe_running(jobs), jobs)
+        with patch.object(core, "process_snapshot", return_value={7: (1, "Ts")}):
+            self.assertEqual(core.observe_running(jobs), jobs)
+            self.assertEqual(core.observe_running([dict(pid=7, status="running")])[0]["status"], "paused")
+
     def test_home_alias_isolates_artifacts_and_old_environment_still_works(self):
         self.assertEqual(core.remote_dir("x"), self.root / "workers/x")
         with patch.dict(os.environ, {}, clear=True):

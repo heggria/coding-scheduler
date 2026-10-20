@@ -49,6 +49,8 @@ const done = [
   elapsed_seconds: 720,
 }));
 const completed = done;
+running[2].status = "paused";
+running[2].reason_text = "进程已暂停，等待恢复；仍占用执行槽位和文件锁";
 let statsMode = "normal";
 let statsHits = 0;
 const statsGroup = (total, ok, blocked, cancelled, failed = 0) => ({
@@ -160,6 +162,10 @@ try {
   await page.goto(origin);
   await page.getByTestId("job-table").waitFor();
   await row("r-alpha").waitFor();
+
+  assert.match(await row("r-gamma").textContent(), /已暂停/);
+  assert.match(await row("r-gamma").textContent(), /仍占用执行槽位和文件锁/);
+  assert.equal(await row("r-gamma").locator(".status-badge.live").count(), 0);
 
   // metrics bar + pool slots
   const metrics = page.getByTestId("metrics-bar");

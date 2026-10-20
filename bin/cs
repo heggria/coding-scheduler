@@ -197,11 +197,11 @@ def cmd_status(args):
         else:
             print("[%s] %s exit=%s elapsed=%ss" % (summary["status"], args.id,
                   summary["exit"], summary["elapsed_seconds"]))
-            print(reason_text(summary["queue_reasons"]))
+            print(summary.get("reason_text") or reason_text(summary["queue_reasons"]))
             print("\n".join(summary["conclusion"]))
             print(json.dumps(summary["artifacts"], ensure_ascii=False))
         return 0
-    running, queued = load_jobs(root, "running"), load_jobs(root, "queue")
+    running, queued = core.observe_running(load_jobs(root, "running")), load_jobs(root, "queue")
     c = counts(running)
     caps = core.reload_caps(root)
     paused = {pool: entry for pool in ("codex", "cc", "opencode")
@@ -218,7 +218,7 @@ def cmd_status(args):
         for job in running + queued:
             print("  [%s] %s tier=%s pool=%s area=%s %s" %
                   (job.get("status"), job["id"], job.get("tier"), job.get("pool") or "-",
-                   job.get("area"), reason_text(job.get("queue_reasons", []))))
+                   job.get("area"), job.get("reason_text") or reason_text(job.get("queue_reasons", []))))
     return 0
 
 

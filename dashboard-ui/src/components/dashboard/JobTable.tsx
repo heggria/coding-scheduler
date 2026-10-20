@@ -25,6 +25,7 @@ export function StatusBadge({ kind }: { kind: string }) {
 
 function Signal({ row }: { row: Row }) {
   const j = row.job;
+  if (row.kind === "paused") return <span className="muted">{j.reason_text || "进程已暂停，等待恢复"}</span>;
   if (row.bucket === "queued") return <ReasonChips job={j} />;
   if (row.bucket === "running")
     return j.log_last_line ? (
@@ -96,7 +97,7 @@ export function JobTable({
             <th>区域</th>
             <th>执行池</th>
             <th>状态</th>
-            <th>运行 / 等待</th>
+            <th>历时 / 等待</th>
             <th>原因 / 最新信号</th>
           </tr>
         </thead>

@@ -181,6 +181,7 @@ def snapshot(status_command=None):
             unique.append(job)
             seen.add(job["id"])
         folders[folder] = unique
+    folders["running"] = core.observe_running(folders["running"])
     now = datetime.now(TZ)
     running = []
     for job in folders["running"]:

@@ -263,8 +263,57 @@ def kill_worker_group(pgid):
     return evidence
 
 
+def process_snapshot():
+    """One bounded, read-only process-tree probe per status snapshot."""
+    try:
+        result = subprocess.run(["ps", "-axo", "pid=,ppid=,stat="],
+                                capture_output=True, text=True, check=True, timeout=5)
+        processes = {}
+        for line in result.stdout.splitlines():
+            pid, parent, state = line.split()
+            processes[int(pid)] = (int(parent), state)
+        return processes
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {}
+
+
+def observe_running(jobs):
+    """Overlay paused display state; lifecycle, locks and capacity stay active.
+
+    The recorded PID is usually a waiting shell, so inspect its descendants too.
+    Unknown/dead PIDs are left to reclaim; failed probes never invent a pause.
+    """
+    if not jobs:
+        return []
+    processes = process_snapshot()
+    children = {}
+    for pid, (parent, _) in processes.items():
+        children.setdefault(parent, []).append(pid)
+    observed = []
+    for job in jobs:
+        item = dict(job)
+        pid = job.get("pid")
+        pending = [pid] if isinstance(pid, int) and pid > 0 and pid in processes else []
+        seen, stopped = set(), []
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            if processes[current][1].startswith("T"):
+                stopped.append(current)
+            pending.extend(children.get(current, []))
+        if stopped:
+            item.update(status="paused", paused_pids=sorted(stopped),
+                        reason_text="进程已暂停，等待恢复；仍占用执行槽位和文件锁")
+        observed.append(item)
+    return observed
+
+
 def job_summary(job, lines=20):
     """Bounded bot output; old records need no migration."""
+    if job.get("status") == "running":
+        job = observe_running([job])[0]
     started = job.get("started_at")
     elapsed = None
     if started:
@@ -298,7 +347,8 @@ def job_summary(job, lines=20):
         result["artifacts"]["last_message"] = str(jd / "last-message.md")
     for field in ("pgid", "cancel_killed_pids", "cancel_signal", "scope_policy", "scope",
                   "changed_files", "need_files", "retry_of", "retried_as", "raw_status", "warnings",
-                  "failure_reason", "failure_detail", "retry_error", "last_queue_reasons", "queue_wait_s"):
+                  "failure_reason", "failure_detail", "retry_error", "last_queue_reasons", "queue_wait_s",
+                  "paused_pids", "reason_text"):
         if field in job:
             result[field] = job[field]
     if job.get("outcome_reason"):
@@ -1239,7 +1289,7 @@ def log_event(root, job):
 
 def write_board(root):
     reload_caps(root)
-    running = load_jobs(root, "running")
+    running = observe_running(load_jobs(root, "running"))
     queued = load_jobs(root, "queue")
     c = counts(running)
     lines = [
@@ -1266,7 +1316,7 @@ def write_board(root):
                 j.get("pool") or "-",
                 j.get("status", ""),
                 j.get("cwd", ""),
-                reason_text(j.get("queue_reasons", [])).replace("|", "\\|").replace("\n", " "),
+                (j.get("reason_text") or reason_text(j.get("queue_reasons", []))).replace("|", "\\|").replace("\n", " "),
             )
         )
     lines.append("")

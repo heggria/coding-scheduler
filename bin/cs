@@ -345,6 +345,21 @@ def cmd_stats(args):
     return 0
 
 
+def cmd_cleanup(args):
+    from cleanup import cleanup_report
+    result = cleanup_report(home(), days=args.days)
+    if args.json:
+        emit(result)
+    else:
+        for name, group in result.items():
+            print("%s %d 约%.2f MB%s" % (name, group["count"], group["bytes"] / 1048576,
+                                       " (partial)" if group.get("partial") else ""))
+            for path in group["items"][:20]:
+                print("  " + path)
+        print("仅列出，未删除")
+    return 0
+
+
 class Parser(argparse.ArgumentParser):
     def error(self, message):
         if "--json" in sys.argv:
@@ -432,11 +447,14 @@ def main():
     dashboard.add_argument("--host", default="127.0.0.1")
     dashboard.add_argument("--port", type=int, default=8787)
     dashboard.set_defaults(func=cmd_dashboard)
-    for parser in (s, r, t, st, w, c, b, d, stats, pool, rc):
+    cleanup = sp.add_parser("cleanup", help="list old cleanup candidates without deleting")
+    cleanup.add_argument("--days", type=line_count, default=7)
+    cleanup.set_defaults(func=cmd_cleanup)
+    for parser in (s, r, t, st, w, c, b, d, stats, pool, rc, cleanup):
         parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     args = ap.parse_args()
     try:
-        if args.cmd in ("wait", "dashboard", "stats") or (args.cmd == "status" and args.no_reclaim):
+        if args.cmd in ("wait", "dashboard", "stats", "cleanup") or (args.cmd == "status" and args.no_reclaim):
             return args.func(args)
         with state_lock(ensure()):
             return args.func(args)

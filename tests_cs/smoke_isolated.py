@@ -48,7 +48,7 @@ def main():
     jid = "cs-ad-smoke"
     submitted = cs("submit", "--project", "cs", "--area", "research", "--read-only", "--tier", "L",
                    "--cwd", str(cwd), "--id", jid, "--prompt-text", "Only run the fake worker.",
-                   "--no-template", "--idempotency-key", "cs-ad-smoke")
+                   "--no-template", "--idempotency-key", "cs-ad-smoke", "--no-tick")
     assert submitted["job"]["status"] == "queued"
     assert submitted["job"]["queue_reasons"] == [{"type": "awaiting_tick"}]
     assert cs("tick")["started"] == [jid]
@@ -62,7 +62,7 @@ def main():
     assert cs("status", jid)["job"]["status"] == "done"
     second = cs("submit", "--project", "cs", "--area", "review", "--read-only", "--tier", "L",
                 "--cwd", str(cwd), "--id", "wait-tick", "--prompt-text", "Only fake worker.",
-                "--no-template", "--files", str(cwd / "review.md"))
+                "--no-template", "--files", str(cwd / "review.md"), "--no-tick")
     assert second["job"]["status"] == "queued"
     assert cs("wait", "wait-tick", "--tick", "--timeout", "5")["jobs"][0]["status"] == "done"
     board = Path(cs("board")["path"])

@@ -60,6 +60,8 @@ def cmd_submit(args):
     if os.environ.get("CS_JOB_ID") and not getattr(args, "allow_nested", False):
         return error(args, "refusing nested submit inside cs job %s; do the task directly "
                      "or pass --allow-nested" % os.environ["CS_JOB_ID"])
+    if args.tick is None:
+        args.tick = not bool(os.environ.get("CS_JOB_ID"))
     core.validate_model(args.pin, args.model)
     files = [f.strip() for f in args.files.split(",") if f.strip()]
     shared_files = [f.strip() for f in args.lock_shared.split(",") if f.strip()]
@@ -97,6 +99,7 @@ def cmd_submit(args):
         "pool": None, "affinity": {}, "pid": None, "conclusion": None, "exit": None,
         "idempotency_key": args.idempotency_key, "model": args.model,
         "requested_model": args.model,
+        "max_added_lines": getattr(args, "max_added_lines", None),
         "read_only": args.read_only,
         "scope_policy": args.scope_policy, "user_prompt": user_prompt,
         "no_template": args.no_template,
@@ -198,6 +201,10 @@ def cmd_status(args):
             print("[%s] %s exit=%s elapsed=%ss" % (summary["status"], args.id,
                   summary["exit"], summary["elapsed_seconds"]))
             print(summary.get("reason_text") or reason_text(summary["queue_reasons"]))
+            if "line_stat" in summary:
+                stat, limit = summary["line_stat"], summary.get("max_added_lines")
+                print("业务代码 +%d/-%d（%d 文件）%s" % (stat["added"], stat["deleted"], stat["files"],
+                      " 超上限 %d" % limit if limit is not None and stat["added"] > limit else ""))
             print("\n".join(summary["conclusion"]))
             print(json.dumps(summary["artifacts"], ensure_ascii=False))
         return 0
@@ -392,7 +399,9 @@ def main():
     s.add_argument("--id", type=identifier, default=None)
     s.add_argument("--review-of", choices=["codex", "cc"], default=None)
     s.add_argument("--read-only", action="store_true", help="conclusion does not require code delivery; empty --files only with --area research")
-    s.add_argument("--tick", action="store_true")
+    s.add_argument("--tick", action="store_true", default=None)
+    s.add_argument("--no-tick", dest="tick", action="store_false")
+    s.add_argument("--max-added-lines", type=line_count)
     s.set_defaults(func=cmd_submit)
 
     r = sp.add_parser("retry", help="clone a terminal job with an expanded declaration")

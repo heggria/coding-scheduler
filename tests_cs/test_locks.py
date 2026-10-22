@@ -285,7 +285,7 @@ class GitIntegrationTests(unittest.TestCase):
             sys.executable, str(REPO / "bin/cs"), "submit", "--project", "fixture",
             "--area", "backend", "--tier", "M", "--cwd", str(self.wt),
             "--prompt", str(prompt), "--id", jid, "--files", files,
-            "--lock-shared", shared,
+            "--lock-shared", shared, "--no-tick",
         ], env=env, capture_output=True, text=True, timeout=15)
 
     def test_submit_warns_directory_cwd_root_and_trailing_slash(self):

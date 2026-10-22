@@ -53,7 +53,7 @@ class SchedulerTests(unittest.TestCase):
         if "--area" not in extra:
             extra = ("--read-only",) + extra
         return json.loads(self.cli("submit", "--project", "fixture", "--area", "research", "--tier", "M",
-                                   "--cwd", str(self.cwd), "--id", jid, "--json", *extra, **kwargs))
+                                   "--cwd", str(self.cwd), "--id", jid, "--json", "--no-tick", *extra, **kwargs))
 
     def record(self, jid="one", folder="queue", **extra):
         job = dict(id=jid, cwd=str(self.cwd), files=[], status="queued" if folder == "queue" else folder,
@@ -348,6 +348,68 @@ class SchedulerTests(unittest.TestCase):
                     "--model", "opencode/custom", "--tick")
         self.assertEqual(core.find_job(self.root, "custom-open")["model"], "opencode/custom")
         self.assertEqual(core.find_job(self.root, "custom-open")["effort"], "max")
+
+    def test_submit_default_tick_and_opt_out(self):
+        args = ("submit", "--project", "fixture", "--area", "research", "--tier", "M",
+                "--cwd", str(self.cwd), "--read-only", "--prompt-text", "goal", "--json")
+        for jid, flags, status in (("default", (), "running"), ("off", ("--no-tick",), "queued"),
+                                   ("explicit", ("--tick",), "running")):
+            job = json.loads(self.cli(*args, "--id", jid, *flags))["job"]
+            self.assertEqual(job["status"], status)
+            if status == "queued":
+                self.assertIn({"type": "awaiting_tick"}, job["queue_reasons"])
+        with patch.dict(os.environ, {"CS_JOB_ID": "parent"}):
+            job = json.loads(self.cli(*args, "--id", "nested-default", "--allow-nested"))["job"]
+            self.assertEqual(job["status"], "queued")
+            self.assertIn({"type": "awaiting_tick"}, job["queue_reasons"])
+
+    def test_completion_business_lines_and_warning(self):
+        def git(*args):
+            return subprocess.run(["git", "-C", str(self.cwd), *args], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        git("init")
+        paths = ["app.py", "tests/x.py", "tests_unit/x.py", "__tests__/x.ts", "test/x.py",
+                 "test_x.py", "x_test.py", "x.test.ts", "x.spec.ts", "notes.md", "docs/x.py",
+                 "dist/x.js", "build/x.js", "lib/dashboard_dist/x.js", "package-lock.json",
+                 "pnpm-lock.yaml", "yarn.lock", "other.lock", "binary.dat"]
+        for path in paths:
+            target = self.cwd / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("base\n")
+        git("add", ".")
+        git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "base")
+        for jid, flags in (("limited", ("--max-added-lines", "5")), ("unlimited", ())):
+            self.submit(jid, "--prompt-text", "goal", *flags)
+        self.cli("tick")
+        for path in paths:
+            (self.cwd / path).write_text("base\n" + "added\n" * 5)
+        (self.cwd / "binary.dat").write_bytes(b"\0binary\n")
+        (self.cwd / "new.py").write_text("new\n" * 3)
+        (self.cwd / "new.bin").write_bytes(b"\0binary\n")
+        (self.cwd / "invalid.bin").write_bytes(b"\xff\n")
+        self.assertEqual(core.reclaim(self.root), 2)
+        for jid in ("limited", "unlimited"):
+            job = core.find_job(self.root, jid)
+            self.assertEqual(job["line_stat"], dict(added=8, deleted=0, files=2))
+            self.assertEqual(job["status"], "done")
+            warnings = [w for w in job["warnings"] if "business lines" in w]
+            self.assertEqual(bool(warnings), jid == "limited")
+            summary = json.loads(self.cli("status", jid, "--json"))["job"]
+            self.assertEqual(summary["line_stat"], job["line_stat"])
+            self.assertEqual(summary["max_added_lines"], 5 if jid == "limited" else None)
+        self.assertIn("business lines +8 exceed --max-added-lines 5", core.find_job(self.root, "limited")["warnings"])
+        self.assertIn("业务代码 +8/-0（2 文件） 超上限 5", self.cli("status", "limited"))
+        (self.cwd / "app.py").write_text("replacement\n" * 5)
+        job = core.find_job(self.root, "limited")
+        core.completion_scope(job, [])
+        self.assertEqual(job["line_stat"], dict(added=8, deleted=1, files=2))
+        self.assertEqual(sum("business lines" in w for w in job["warnings"]), 1)
+        job["max_added_lines"] = 8
+        job["warnings"] = []
+        core.completion_scope(job, [])
+        self.assertEqual(job["warnings"], [])
+        for value in ("-1", "1.5"):
+            self.submit("invalid", "--prompt-text", "goal", "--max-added-lines", value, expected=2)
 
     def test_nested_submit_refused_unless_allowed(self):
         with patch.dict(os.environ, {"CS_JOB_ID": "parent-job"}):

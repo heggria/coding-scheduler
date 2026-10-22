@@ -30,6 +30,8 @@ export interface Reason {
   detail?: string;
 }
 export interface Job {
+  line_stat?: { added: number; deleted: number; files: number };
+  max_added_lines?: number | null;
   id: string;
   project?: string | null;
   model?: string | null;

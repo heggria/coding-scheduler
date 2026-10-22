@@ -349,7 +349,7 @@ def job_summary(job, lines=20):
     for field in ("pgid", "cancel_killed_pids", "cancel_signal", "scope_policy", "scope",
                   "changed_files", "need_files", "retry_of", "retried_as", "raw_status", "warnings",
                   "failure_reason", "failure_detail", "retry_error", "last_queue_reasons", "queue_wait_s",
-                  "paused_pids", "reason_text"):
+                  "paused_pids", "reason_text", "line_stat", "max_added_lines"):
         if field in job:
             result[field] = job[field]
     if job.get("outcome_reason"):
@@ -871,6 +871,16 @@ def protected_scope_paths(job, running):
     return list(dict.fromkeys(paths))
 
 
+def business_code(path):
+    parts = Path(path).parts
+    name = parts[-1]
+    return not (any(p in ("test", "tests", "__tests__", "docs", "dist", "build") or
+                    p.startswith("tests_") or p.endswith("_dist") for p in parts[:-1]) or
+                name.startswith("test_") or re.search(r"(_test\.|\.test\.|\.spec\.)", name) or
+                name.endswith((".md", ".lock")) or
+                name in ("package-lock.json", "pnpm-lock.yaml", "yarn.lock"))
+
+
 def completion_scope(job, running):
     """Best-effort repository snapshot, including untracked files; never enforce."""
     cwd = job.get("cwd")
@@ -881,7 +891,33 @@ def completion_scope(job, running):
     changed = [name for name in (names or "").split("\0") if name]
     if names is not None:
         untracked = git_output(cwd, "ls-files", "--others", "--exclude-standard", "-z", "--", ".")
-        changed.extend(name for name in (untracked or "").split("\0") if name)
+        untracked = [name for name in (untracked or "").split("\0") if name]
+        changed.extend(untracked)
+        numstat = git_output(cwd, "diff", "--numstat", "--relative", "--no-renames", "-z",
+                             job["base_sha"], "--", ".")
+        if numstat is not None:
+            stat = {"added": 0, "deleted": 0, "files": 0}
+            for entry in filter(None, numstat.split("\0")):
+                added, deleted, path = entry.split("\t", 2)
+                if added != "-" and deleted != "-" and business_code(path):
+                    stat["added"] += int(added)
+                    stat["deleted"] += int(deleted)
+                    stat["files"] += 1
+            for path in filter(business_code, untracked):
+                try:
+                    data = (Path(cwd) / path).read_bytes()
+                    if b"\0" in data:
+                        continue
+                    added = data.decode("utf-8").count("\n")
+                except (OSError, UnicodeError):
+                    continue
+                stat["added"] += added
+                stat["files"] += 1
+            job["line_stat"] = stat
+            limit = job.get("max_added_lines")
+            if limit is not None and stat["added"] > limit:
+                warning = "business lines +%d exceed --max-added-lines %d" % (stat["added"], limit)
+                job["warnings"] = list(dict.fromkeys((job.get("warnings") or []) + [warning]))
     job["changed_files"] = sorted(set(changed))
     declared = [os.path.relpath(str((Path(cwd) / path).resolve()), cwd)
                 for path in (job.get("files") or []) + (job.get("shared_files") or [])] if cwd else []

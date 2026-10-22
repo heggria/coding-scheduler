@@ -372,6 +372,12 @@ export function JobInspector({
       <div className="inspector-body">
         {tab === "overview" && (
           <>
+            <Field label="业务代码">{j.line_stat ? (
+              <span style={{ color: j.max_added_lines != null && j.line_stat.added > j.max_added_lines ? "var(--red)" : undefined }}>
+                +{j.line_stat.added} / -{j.line_stat.deleted} · {j.line_stat.files} 文件
+                {j.max_added_lines != null && j.line_stat.added > j.max_added_lines && ` 超上限 ${j.max_added_lines}`}
+              </span>
+            ) : "—"}</Field>
             <Field label="执行模型">{j.model || "未记录"}</Field>
             <Field label="执行池 / 偏好">
               {j.pool ? poolName(j.pool) : "待分配"} / {j.pin || "—"}

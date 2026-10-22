@@ -472,6 +472,28 @@ tokens used
         self.assertEqual(command["exit"], 1)
         self.assertIn("first\nsecond\nthird", command["text"])
 
+    def test_cc_source_prefers_session_id_and_keeps_heuristic(self):
+        job = dict(cwd=str(self.base), started_at=self.now.isoformat())
+        sessions = self.base / ".claude/projects" / log_events.re.sub(r"[^A-Za-z0-9]", "-", job["cwd"])
+        sessions.mkdir(parents=True)
+        session_id = "12345678-1234-4234-8234-123456789abc"
+        exact = sessions / (session_id + ".jsonl")
+        exact.write_text(json.dumps(dict(timestamp=(self.now - timedelta(seconds=5)).isoformat())))
+        closer = sessions / "closer.jsonl"
+        closer.write_text(json.dumps(dict(timestamp=self.now.isoformat())))
+        self.assertEqual(log_events.cc_source(job), closer)
+        job["cc_session_id"] = session_id
+        self.assertEqual(log_events.cc_source(job), exact)
+        other = sessions.parent / "other"
+        other.mkdir()
+        moved = exact.rename(other / exact.name)
+        self.assertEqual(log_events.cc_source(job), moved)
+        moved.unlink()
+        self.assertEqual(log_events.cc_source(job), closer)
+        (sessions.parent / "x.jsonl").write_text("escape")
+        job["cc_session_id"] = "../x"
+        self.assertEqual(log_events.cc_source(job), closer)
+
     def test_cc_events_match_session_and_filter_content(self):
         directory = self.worker_dir("cc-events")
         job = dict(pool="cc", cwd=str(self.base), started_at=self.now.isoformat(),

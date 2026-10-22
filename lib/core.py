@@ -5,6 +5,7 @@ import fcntl
 import json
 import math
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -1043,9 +1044,11 @@ def launch(root, job, pool):
                         q(extract), q(str(events)), q(str(last))))
         else:
             cc_effort = "high" if effort == "medium" else effort
-            command = ("claude -p --dangerously-skip-permissions --model %s --effort %s "
+            job["cc_session_id"] = str(uuid.uuid4())
+            write_job(root, "queue", job)
+            command = ("claude -p --dangerously-skip-permissions --model %s --effort %s --session-id %s "
                        '\"$(cat %s)\" > %s || w_rc=$?\n' %
-                       (q(model), q(cc_effort), q(str(prompt_on_disk)), q(str(last))))
+                       (q(model), q(cc_effort), q(job["cc_session_id"]), q(str(prompt_on_disk)), q(str(last))))
         command = ("w_rc=0\n" + command +
                    "if [ ! -s %s ] && [ -s %s ]; then cp %s %s; fi\n" % (
                        q(str(conclusion)), q(str(last)), q(str(last)), q(str(conclusion))) +
@@ -1054,10 +1057,19 @@ def launch(root, job, pool):
         # EXIT trap records nonzero command/cd failures too (old set -e lost them).
         trap = ('rc=$?; printf "%s\\n" "$rc" > ' + q(str(exit_file) + ".tmp") +
                 "; mv " + q(str(exit_file) + ".tmp") + " " + q(str(exit_file)))
+        git_env = ""
+        if not git_output(cwd, "config", "user.email"):
+            author = (git_output(cwd, "log", "-1", "--author=" + pwd.getpwuid(os.getuid()).pw_name,
+                                 "--format=%an%n%ae") or "").splitlines()
+            if len(author) == 2 and all(author):
+                git_env = "export " + " ".join(key + "=" + q(value) for key, value in (
+                    ("GIT_AUTHOR_NAME", author[0]), ("GIT_AUTHOR_EMAIL", author[1]),
+                    ("GIT_COMMITTER_NAME", author[0]), ("GIT_COMMITTER_EMAIL", author[1]))) + "\n"
         run_sh.write_text("#!/bin/bash\nset -euo pipefail\n" +
                           "trap " + q(trap) + " EXIT\n" +
                           # Workers inherit CS_JOB_ID so nested agents can detect cs jobs.
                           "export CS_JOB_ID=" + q(job["id"]) + "\n" +
+                          git_env +
                           "cd " + q(cwd) + "\n" + command + "\n")
         with log.open("w") as output:
             # Detach stdin: opencode run reads a non-TTY stdin and blocks forever on it.

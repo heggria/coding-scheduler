@@ -215,11 +215,21 @@ def json_events(text, pool):
 
 
 def cc_source(job):
+    directory = Path.home() / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", job.get("cwd", ""))
+    session_id = job.get("cc_session_id")
+    if isinstance(session_id, str) and re.fullmatch(
+            r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", session_id):
+        source = safe_file(directory, session_id + ".jsonl")
+        if source:
+            return source
+        for path in directory.parent.glob("*/" + session_id + ".jsonl"):
+            source = safe_file(path.parent, path.name)
+            if source:
+                return source
     start = moment(job.get("started_at"))
     end = moment(job.get("finished_at")) or datetime.now(timezone.utc)
     if start is None:
         return None
-    directory = Path.home() / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", job.get("cwd", ""))
     candidates = []
     for path in directory.glob("*.jsonl"):
         if not safe_file(directory, path.name):

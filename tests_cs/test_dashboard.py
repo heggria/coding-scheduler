@@ -430,6 +430,18 @@ tokens used
         self.assertNotIn("PRIVATE", json.dumps(data))
         self.assertNotIn("noise", json.dumps(data))
 
+    def test_opencode_only_keeps_last_step_finish(self):
+        directory = self.worker_dir("oc-last-finish")
+        rows = [dict(type="step_finish", timestamp=stamp, part=dict(
+            tokens=dict(input=stamp * 10), cost=stamp / 100, reason=reason))
+            for stamp, reason in ((1, "tool-calls"), (2, "tool-calls"), (3, "stop"))]
+        (directory / "output.jsonl").write_text("\n".join(json.dumps(row) for row in rows))
+        events = log_events.job_events(dict(pool="opencode"), directory)["events"]
+        ends = [event for event in events if event["kind"] == "end"]
+        self.assertEqual(len(ends), 1)
+        self.assertEqual(ends[0]["text"], "tokens: {'input': 30} · cost: 0.03 · stop")
+        self.assertEqual(ends[0]["ts"], 3)
+
     def test_opencode_snapshots_keep_latest_tool_and_text(self):
         rows = [dict(type="tool_use", part=dict(id="tool", tool="shell", state=dict(status="running", input=dict(command="pytest")))),
                 dict(type="text", part=dict(id="text", text="partial")),

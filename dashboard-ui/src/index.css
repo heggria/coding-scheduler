@@ -478,3 +478,8 @@ button.heat-cell:not(:disabled):hover { outline: 1px solid var(--text); }
 .process-event > small { margin-right: 6px; }
 .process-event pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 10.5px/1.5 var(--mono); margin-top: 4px; }
 .process-error { color: var(--red); }
+.process-summary { display: block; width: 100%; text-align: left; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.process-expand { padding: 2px 0 6px; color: var(--muted); font-size: 11px; }
+.process-group > .process-event { padding-left: 12px; }
+.process-meta { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 10px; }
+.process-meta pre { display: inline; margin: 0; white-space: nowrap; font-size: inherit; }

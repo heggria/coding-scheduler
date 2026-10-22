@@ -161,12 +161,14 @@ function LogViewer({ id, running, fallback }: { id: string; running: boolean; fa
 function ProcessViewer({ id, running, fallback }: { id: string; running: boolean; fallback?: string | null }) {
   const [raw, setRaw] = useState(false);
   const [events, setEvents] = useState<JobEvent[]>([]);
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const [note, setNote] = useState("");
   const pane = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   useEffect(() => {
     setRaw(false);
     setEvents([]);
+    setExpanded(new Set());
     setNote("");
     stick.current = true;
   }, [id]);
@@ -203,6 +205,36 @@ function ProcessViewer({ id, running, fallback }: { id: string; running: boolean
   useEffect(() => {
     if (pane.current && stick.current) pane.current.scrollTop = pane.current.scrollHeight;
   }, [events, raw]);
+  const eventKey = (event: JobEvent) => `${event.ts ?? ""}|${event.kind}|${event.text.slice(0, 80)}`;
+  const isError = (event: JobEvent) => event.kind === "error" || (event.kind === "cmd" && event.exit != null && event.exit !== 0);
+  const groups: { key: string; items: JobEvent[]; folded: boolean }[] = [];
+  const occurrences = new Map<string, number>();
+  for (const event of events) {
+    const folded = !["say", "start", "end"].includes(event.kind);
+    const previous = groups[groups.length - 1];
+    if (folded && previous?.folded) previous.items.push(event);
+    else {
+      const key = eventKey(event), occurrence = occurrences.get(key) ?? 0;
+      occurrences.set(key, occurrence + 1);
+      groups.push({ key: `${key}|${occurrence}`, items: [event], folded });
+    }
+  }
+  const toggle = (key: string) => setExpanded((current) => {
+    const next = new Set(current);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    return next;
+  });
+  const detail = (event: JobEvent, key: string, text = event.text) => (
+    <div key={key} className={cn("process-event", isError(event) && "process-error",
+      (event.kind === "start" || event.kind === "end") && "process-meta")}>
+      <small className="badge">{event.kind}</small>
+      {event.ts != null && <small className="muted">{typeof event.ts === "number" ? clock(event.ts) : event.ts}</small>}
+      {event.kind === "cmd" && event.exit != null && <small>exit {event.exit}</small>}
+      <pre>{text}</pre>
+    </div>
+  );
+  const labels = { cmd: "命令", edit: "改文件", test: "测试", think: "思考", error: "报错" } as const;
   return (
     <div className="log-viewer">
       <div className="process-toggle" role="group" aria-label="日志显示方式">
@@ -217,14 +249,32 @@ function ProcessViewer({ id, running, fallback }: { id: string; running: boolean
           const el = pane.current;
           if (el) stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
         }}>
-          {events.map((event, index) => (
-            <div key={index} className={cn("process-event", (event.kind === "error" || (event.exit != null && event.exit !== 0)) && "process-error")}>
-              <small className="badge">{event.kind}</small>
-              {event.ts != null && <small className="muted">{typeof event.ts === "number" ? clock(event.ts) : event.ts}</small>}
-              {event.kind === "cmd" && event.exit != null && <small>exit {event.exit}</small>}
-              <pre>{event.text}</pre>
-            </div>
-          ))}
+          {groups.map(({ key, items, folded }) => {
+            const open = expanded.has(key), event = items[0];
+            if (folded) {
+              const detailOccurrences = new Map<string, number>();
+              const summary = (Object.keys(labels) as (keyof typeof labels)[]).map((kind) => {
+                const count = items.filter((item) => item.kind === kind).length;
+                return count ? `${labels[kind]} ${count}` : "";
+              }).filter(Boolean).join(" · ");
+              return <div key={key} className="process-group">
+                <button type="button" className={cn("process-summary", items.some(isError) && "process-error")}
+                  aria-expanded={open} onClick={() => toggle(key)}>{open ? "▾" : "▸"} {summary}</button>
+                {open && items.map((item) => {
+                  const itemKey = eventKey(item), occurrence = detailOccurrences.get(itemKey) ?? 0;
+                  detailOccurrences.set(itemKey, occurrence + 1);
+                  return detail(item, `${itemKey}|${occurrence}`);
+                })}
+              </div>;
+            }
+            const preview = event.text.split("\n").slice(0, 4).join("\n").slice(0, 300);
+            const long = event.kind === "say" && preview.length < event.text.length;
+            return <div key={key}>
+              {detail(event, key, long && !open ? `${preview}…` : event.text)}
+              {long && <button type="button" className="process-expand" aria-expanded={open}
+                onClick={() => toggle(key)}>{open ? "收起" : "展开"}</button>}
+            </div>;
+          })}
         </div>
       </>}
     </div>

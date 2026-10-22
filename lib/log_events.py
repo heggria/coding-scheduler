@@ -139,6 +139,7 @@ def tool_event(events, name, inputs, output, code=None, ts=None, error=None):
 
 def json_events(text, pool):
     events, tools = [], {}
+    last_finish = None
     lines = text.splitlines()
     if pool == "opencode":
         latest = {}
@@ -176,8 +177,7 @@ def json_events(text, pool):
                 tool_event(events, part.get("tool", ""), state.get("input") or {},
                            state.get("output", ""), code, ts, state.get("error"))
             elif kind == "step_finish":
-                emit(events, "end", "tokens: %s · cost: %s · %s" % (
-                    part.get("tokens", {}), part.get("cost", 0), part.get("reason", "")), ts)
+                last_finish = (part, ts)
             elif kind == "error":
                 emit(events, "error", redact(json.dumps(row.get("error", {})))[:600], ts)
         elif kind in ("assistant", "user"):
@@ -203,6 +203,10 @@ def json_events(text, pool):
                         code = int(match.group(1)) if match else (1 if block.get("is_error") else 0)
                         tool_event(events, tool[0], tool[1], output, code, tool[2],
                                    "Tool execution failed" if block.get("is_error") else None)
+    if last_finish is not None:
+        part, ts = last_finish
+        emit(events, "end", "tokens: %s · cost: %s · %s" % (
+            part.get("tokens", {}), part.get("cost", 0), part.get("reason", "")), ts)
     for name, inputs, ts in tools.values():
         tool_event(events, name, inputs, "", ts=ts)
     if pool == "cc":

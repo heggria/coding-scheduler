@@ -62,21 +62,41 @@ def context_text(cwd, specs):
     for spec in specs:
         name, start, end = re.fullmatch(r"(.*?)(?::(-?\d+)-(-?\d+))?", spec, re.S).groups()
         path = (cwd / Path(name).expanduser()).resolve()
-        private_json = path.suffix == ".json" and any(parent in path.parents for parent in
-            (Path.home() / ".codex", Path.home() / ".claude"))
-        if (set(path.parts) & {".ssh", ".gnupg", ".aws"} or private_json or
-                path.name in {".env", "auth.json", ".npmrc", ".netrc", ".pypirc", "credentials"} or
-                path.name.startswith((".env.", "id_rsa", "id_ed25519"))):
+        comparison = Path(str(path).lower())
+        private_json = comparison.suffix == ".json" and any(parent in comparison.parents for parent in
+            (Path(str(Path.home() / directory).lower()) for directory in (".codex", ".claude")))
+        if (set(comparison.parts) & {".ssh", ".gnupg", ".aws", ".kube", ".docker"} or private_json or
+                (".config", "gh") in tuple(zip(comparison.parts, comparison.parts[1:])) or
+                comparison.name in {".env", "auth.json", ".npmrc", ".netrc", ".pypirc", "credentials", ".git-credentials"} or
+                comparison.name.startswith((".env.", "id_rsa", "id_ed25519"))):
             raise ValueError("credential context path refused: " + name)
         if not path.is_file():
             raise ValueError("context path is not a file: " + name)
         first, last = (int(start), int(end)) if start is not None else (1, None)
         if first < 1 or (last is not None and last < first):
             raise ValueError("invalid context line range: " + spec)
+        selected, size, line, seen = [], len("\n\n".join(sections).encode("utf-8")) + (2 if sections else 0), 1, 0
+        header = "### %s:%d-%d\n" % (name, first, last if last is not None else 0)
         with path.open(encoding="utf-8", newline="") as source:
-            lines = source.read().splitlines(keepends=True)
-        last = len(lines) if last is None else last
-        sections.append("### %s:%d-%d\n%s" % (name, first, last, "".join(lines[first - 1:last])))
+            while last is None or line <= last:
+                chunk = source.readline(CONTEXT_LIMIT + 1)
+                if not chunk:
+                    break
+                if len(chunk) == CONTEXT_LIMIT + 1 and chunk.endswith("\r"):
+                    position, tail = source.tell(), source.read(1)
+                    if tail == "\n":
+                        chunk += tail
+                    else:
+                        source.seek(position)
+                seen = line
+                if line >= first:
+                    selected.append(chunk)
+                    size += len(chunk.encode("utf-8"))
+                header = "### %s:%d-%d\n" % (name, first, last if last is not None else seen)
+                if size + len(header.encode("utf-8")) > CONTEXT_LIMIT:
+                    raise ValueError("context exceeds 64KB; use line ranges to narrow it")
+                line += chunk.endswith(("\n", "\r"))
+        sections.append(header + "".join(selected))
     text = "\n\n".join(sections)
     if len(text.encode("utf-8")) > CONTEXT_LIMIT:
         raise ValueError("context exceeds 64KB; use line ranges to narrow it")

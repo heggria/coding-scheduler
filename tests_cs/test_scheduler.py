@@ -586,12 +586,20 @@ class SchedulerTests(unittest.TestCase):
         source = self.cwd / "notes.md"
         source.write_text("ok\n")
         sensitive = [".env", ".env.local", ".ssh/x", ".gnupg/x", ".aws/x", "auth.json",
-                     ".npmrc", ".netrc", ".pypirc", "credentials", "id_rsa.pub", "id_ed25519.x"]
+                     ".npmrc", ".netrc", ".pypirc", "credentials", "id_rsa.pub", "id_ed25519.x",
+                     ".ENV", ".SSH/x", "AUTH.JSON", ".git-credentials", ".CONFIG/GH/hosts.yml",
+                     ".KUBE/config", ".DOCKER/config.json"]
         for name in sensitive:
             path = self.cwd / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("secret")
         (self.cwd / "alias").symlink_to(self.cwd / ".env")
+        (self.cwd / "ssh-alias").symlink_to(self.cwd / ".ssh")
+        sensitive.append("ssh-alias/x")
+        with patch.object(Path, "open", side_effect=AssertionError("must reject before open")):
+            for name in sensitive:
+                with self.assertRaisesRegex(ValueError, "credential"):
+                    CLI["context_text"](self.cwd, [name])
         for index, spec in enumerate(sensitive + ["alias", "missing", ".", "", "notes.md:0-1",
                                                   "notes.md:2-1", "notes.md:-1-2", "notes.md:1-x"]):
             with self.subTest(spec=spec):
@@ -606,9 +614,31 @@ class SchedulerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "line ranges"):
             CLI["context_text"](self.cwd, ["notes.md", "notes.md"])
         with patch.object(Path, "home", return_value=self.base):
-            for name in (".codex/nested/data.json", ".claude/data.json"):
+            for name in (".codex/nested/data.json", ".claude/data.json", ".CODEX/x.JSON"):
                 with self.assertRaisesRegex(ValueError, "credential"):
                     CLI["context_text"](self.cwd, [str(self.base / name)])
+
+    def test_context_bounded_reads_and_large_file_ranges(self):
+        source = self.cwd / "large.txt"
+        source.write_text("x" * 200000 + "\nsmall\n" + "z" * 200000)
+        result = self.submit("too-large", "--prompt-text", "goal", "--context", "large.txt", expected=2)
+        self.assertIn("64KB", result["error"])
+        self.assertEqual(list((self.root / "queue").iterdir()), [])  # No JSON or prompt.
+        stream = io.StringIO(source.read_text())
+        bounded_readline = stream.readline
+        def readline(size=-1):
+            self.assertTrue(0 < size <= CLI["CONTEXT_LIMIT"] + 1)
+            return bounded_readline(size)
+        with patch.object(Path, "open", return_value=stream), \
+                patch.object(stream, "close"), \
+                patch.object(stream, "read", side_effect=AssertionError("unbounded read")), \
+                patch.object(stream, "readline", side_effect=readline):
+            self.assertEqual(CLI["context_text"](self.cwd, ["large.txt:2-2"]), "### large.txt:2-2\nsmall\n")
+            self.assertEqual(stream.tell(), 200007)  # Stop at the requested end line.
+        self.submit("small-range", "--prompt-text", "goal", "--context", "large.txt:2-2")
+        self.assertEqual(core.find_job(self.root, "small-range")["context_text"], "### large.txt:2-2\nsmall\n")
+        source.write_bytes(b"x" * 65536 + b"\r\nsmall\rfinal")
+        self.assertEqual(CLI["context_text"](self.cwd, ["large.txt:2-3"]), "### large.txt:2-3\nsmall\rfinal")
 
     def test_submit_declaration_for_write_read_only_and_no_template(self):
         (self.root / "projects/fixture.md").write_text("project rules\n")

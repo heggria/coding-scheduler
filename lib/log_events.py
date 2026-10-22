@@ -138,7 +138,7 @@ def tool_event(events, name, inputs, output, code=None, ts=None, error=None):
 
 
 def json_events(text, pool):
-    events, tools, seen = [], {}, set()
+    events, tools = [], {}
     lines = text.splitlines()
     if pool == "opencode":
         latest = {}
@@ -165,11 +165,6 @@ def json_events(text, pool):
         ts, kind = row.get("timestamp"), row.get("type")
         if pool == "opencode":
             part = row.get("part") or {}
-            # Part IDs identify repeated snapshots; text equality alone does not.
-            key = (kind, part.get("id"), json.dumps(part, sort_keys=True))
-            if key in seen:
-                continue
-            seen.add(key)
             if kind == "text":
                 emit(events, "say", redact(part.get("text", ""))[:600], ts)
             elif kind == "tool_use":
@@ -207,7 +202,7 @@ def json_events(text, pool):
                         match = re.search(r"(?:Exit code:?|exit code|exited with code)\s*(\d+)", str(output), re.I)
                         code = int(match.group(1)) if match else (1 if block.get("is_error") else 0)
                         tool_event(events, tool[0], tool[1], output, code, tool[2],
-                                   output if block.get("is_error") else None)
+                                   "Tool execution failed" if block.get("is_error") else None)
     for name, inputs, ts in tools.values():
         tool_event(events, name, inputs, "", ts=ts)
     if pool == "cc":

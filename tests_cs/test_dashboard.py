@@ -440,6 +440,26 @@ tokens used
         self.assertEqual(events[0]["text"], "Complete")
         self.assertEqual(events[1]["exit"], 0)
 
+    def test_opencode_identical_calls_without_part_ids_are_preserved(self):
+        rows = [dict(type="tool_use", timestamp=stamp, part=dict(tool="shell", state=dict(
+            status="completed", input=dict(command="echo done"), output="done", metadata=dict(exit=0))))
+            for stamp in (1, 2)]
+        events = log_events.json_events("\n".join(json.dumps(row) for row in rows), "opencode")
+        self.assertEqual([event["kind"] for event in events], ["cmd", "cmd"])
+        self.assertEqual([event["exit"] for event in events], [0, 0])
+
+    def test_cc_failed_command_only_keeps_output_tail(self):
+        output = "PRIVATE OUTPUT HEADER\n" + "noise\n" * 10 + "first\nsecond\nthird"
+        rows = [dict(type="assistant", message=dict(content=[dict(
+            type="tool_use", id="cmd", name="Bash", input=dict(command="broken"))])),
+            dict(type="user", message=dict(content=[dict(
+                type="tool_result", tool_use_id="cmd", is_error=True, content=output)]))]
+        events = log_events.json_events("\n".join(json.dumps(row) for row in rows), "cc")
+        self.assertNotIn("PRIVATE OUTPUT HEADER", json.dumps(events))
+        command = next(event for event in events if event["kind"] == "cmd")
+        self.assertEqual(command["exit"], 1)
+        self.assertIn("first\nsecond\nthird", command["text"])
+
     def test_cc_events_match_session_and_filter_content(self):
         directory = self.worker_dir("cc-events")
         job = dict(pool="cc", cwd=str(self.base), started_at=self.now.isoformat(),

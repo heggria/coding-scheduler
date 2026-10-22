@@ -205,19 +205,18 @@ function ProcessViewer({ id, running, fallback }: { id: string; running: boolean
   useEffect(() => {
     if (pane.current && stick.current) pane.current.scrollTop = pane.current.scrollHeight;
   }, [events, raw]);
-  const eventKey = (event: JobEvent) => `${event.ts ?? ""}|${event.kind}|${event.text.slice(0, 80)}`;
   const isError = (event: JobEvent) => event.kind === "error" || (event.kind === "cmd" && event.exit != null && event.exit !== 0);
   const groups: { key: string; items: JobEvent[]; folded: boolean }[] = [];
-  const occurrences = new Map<string, number>();
-  for (const event of events) {
+  let sayCount = 0;
+  for (const [index, event] of events.entries()) {
     const folded = !["say", "start", "end"].includes(event.kind);
     const previous = groups[groups.length - 1];
     if (folded && previous?.folded) previous.items.push(event);
     else {
-      const key = eventKey(event), occurrence = occurrences.get(key) ?? 0;
-      occurrences.set(key, occurrence + 1);
-      groups.push({ key: `${key}|${occurrence}`, items: [event], folded });
+      const key = event.kind === "say" ? `say-${sayCount}` : folded ? `group-${sayCount}` : `meta-${index}`;
+      groups.push({ key, items: [event], folded });
     }
+    if (event.kind === "say") sayCount += 1;
   }
   const toggle = (key: string) => setExpanded((current) => {
     const next = new Set(current);
@@ -252,7 +251,6 @@ function ProcessViewer({ id, running, fallback }: { id: string; running: boolean
           {groups.map(({ key, items, folded }) => {
             const open = expanded.has(key), event = items[0];
             if (folded) {
-              const detailOccurrences = new Map<string, number>();
               const summary = (Object.keys(labels) as (keyof typeof labels)[]).map((kind) => {
                 const count = items.filter((item) => item.kind === kind).length;
                 return count ? `${labels[kind]} ${count}` : "";
@@ -260,11 +258,7 @@ function ProcessViewer({ id, running, fallback }: { id: string; running: boolean
               return <div key={key} className="process-group">
                 <button type="button" className={cn("process-summary", items.some(isError) && "process-error")}
                   aria-expanded={open} onClick={() => toggle(key)}>{open ? "▾" : "▸"} {summary}</button>
-                {open && items.map((item) => {
-                  const itemKey = eventKey(item), occurrence = detailOccurrences.get(itemKey) ?? 0;
-                  detailOccurrences.set(itemKey, occurrence + 1);
-                  return detail(item, `${itemKey}|${occurrence}`);
-                })}
+                {open && items.map((item, index) => detail(item, String(index)))}
               </div>;
             }
             const preview = event.text.split("\n").slice(0, 4).join("\n").slice(0, 300);

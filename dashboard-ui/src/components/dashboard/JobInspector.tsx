@@ -208,15 +208,17 @@ function ProcessViewer({ id, running, fallback }: { id: string; running: boolean
   const isError = (event: JobEvent) => event.kind === "error" || (event.kind === "cmd" && event.exit != null && event.exit !== 0);
   const groups: { key: string; items: JobEvent[]; folded: boolean }[] = [];
   let sayCount = 0;
+  let metaCount = 0;
   for (const [index, event] of events.entries()) {
     const folded = !["say", "start", "end"].includes(event.kind);
     const previous = groups[groups.length - 1];
     if (folded && previous?.folded) previous.items.push(event);
     else {
-      const key = event.kind === "say" ? `say-${sayCount}` : folded ? `group-${sayCount}` : `meta-${index}`;
+      const key = event.kind === "say" ? `say-${sayCount}` : folded ? `group-${sayCount}-${metaCount}` : `meta-${index}`;
       groups.push({ key, items: [event], folded });
     }
     if (event.kind === "say") sayCount += 1;
+    if (event.kind === "start" || event.kind === "end") metaCount += 1;
   }
   const toggle = (key: string) => setExpanded((current) => {
     const next = new Set(current);

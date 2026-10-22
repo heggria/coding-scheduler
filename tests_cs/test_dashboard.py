@@ -18,6 +18,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "lib"))
 import core
 import dashboard
+import log_events
 
 CLI = runpy.run_path(str(REPO / "bin/cs"), run_name="cs_dashboard_tests")
 
@@ -362,6 +363,141 @@ class DashboardTests(unittest.TestCase):
         self.log_request("ro")
         self.log_request("missing")
         self.assertEqual(before, {str(p): p.stat().st_mtime_ns for p in self.base.rglob("*")})
+
+    def test_codex_events_filter_prompt_diff_outputs_and_redact(self):
+        directory = self.worker_dir("codex-events")
+        (directory / "log").write_text("""header
+--------
+model: test
+--------
+user
+PRIVATE PROMPT
+warning: inside prompt
+codex
+Working sk-abcdefghijklmnop1234 token=private
+**Check tests**
+exec
+python3 -m unittest in /repo succeeded in 22ms:
+NOISY OUTPUT
+Ran 2 tests in 0.01s
+OK
+exec
+bad command in /repo exited 2 in 4ms:
+hidden output
+first
+second
+third
+apply patch
+patch: completed
+M /repo/file.py
+diff --git a/file.py b/file.py
++PRIVATE DIFF
+codex
+Done
+warning: repeated
+warning: repeated
+tokens used
+123
+""")
+        (directory / "conclusion.md").write_text("Details\nSTATUS: DONE\n")
+        data = log_events.job_events(dict(pool="codex", started_at=self.now.isoformat()), directory)
+        kinds = [event["kind"] for event in data["events"]]
+        for kind in ("start", "say", "think", "cmd", "edit", "test", "error", "end"):
+            self.assertIn(kind, kinds)
+        text = json.dumps(data)
+        for private in ("PRIVATE", "NOISY", "hidden output", "abcdefghijklmnop1234", "token=private"):
+            self.assertNotIn(private, text)
+        commands = [event for event in data["events"] if event["kind"] == "cmd"]
+        self.assertEqual([event["exit"] for event in commands], [0, 2])
+        self.assertIn("first\nsecond\nthird", commands[1]["text"])
+        self.assertEqual(sum(e["kind"] == "error" for e in data["events"]), 1)
+        self.assertTrue(data["events"][-1]["text"].startswith("STATUS:"))
+        self.assertEqual(len(log_events.job_events(dict(pool="codex"), directory, 2)["events"]), 2)
+
+    def test_opencode_events_filter_tools_and_json_noise(self):
+        directory = self.worker_dir("oc-events")
+        rows = [dict(type="step_start"), dict(type="text", timestamp=1, part=dict(text="Working")),
+                dict(type="tool_use", part=dict(tool="read", state=dict(status="completed", input=dict(path="PRIVATE"), output="PRIVATE"))),
+                dict(type="tool_use", part=dict(tool="shell", state=dict(status="running", input=dict(command="long-running")))),
+                dict(type="tool_use", part=dict(tool="shell", state=dict(status="completed", input=dict(command="pytest"), output="noise\n3 passed", metadata=dict(metadata=dict(exit=0))))),
+                dict(type="tool_use", part=dict(tool="edit", state=dict(status="completed", input=dict(path="/repo/a.py")))),
+                dict(type="step_finish", part=dict(tokens=dict(input=10), reason="stop"))]
+        (directory / "output.jsonl").write_text("\n".join(json.dumps(row) for row in rows) + "\n{broken\n")
+        (directory / "log").write_text("warning: stderr warning\n")
+        data = log_events.job_events(dict(pool="opencode"), directory)
+        kinds = [event["kind"] for event in data["events"]]
+        self.assertEqual(kinds, ["say", "cmd", "cmd", "test", "edit", "end", "error"])
+        self.assertNotIn("PRIVATE", json.dumps(data))
+        self.assertNotIn("noise", json.dumps(data))
+
+    def test_opencode_snapshots_keep_latest_tool_and_text(self):
+        rows = [dict(type="tool_use", part=dict(id="tool", tool="shell", state=dict(status="running", input=dict(command="pytest")))),
+                dict(type="text", part=dict(id="text", text="partial")),
+                dict(type="text", part=dict(id="text", text="Complete")),
+                dict(type="tool_use", part=dict(id="tool", tool="shell", state=dict(status="completed", input=dict(command="pytest"), output="2 passed", metadata=dict(exit=0))))]
+        events = log_events.json_events("\n".join(json.dumps(row) for row in rows), "opencode")
+        self.assertEqual([event["kind"] for event in events], ["say", "cmd", "test"])
+        self.assertEqual(events[0]["text"], "Complete")
+        self.assertEqual(events[1]["exit"], 0)
+
+    def test_cc_events_match_session_and_filter_content(self):
+        directory = self.worker_dir("cc-events")
+        job = dict(pool="cc", cwd=str(self.base), started_at=self.now.isoformat(),
+                   finished_at=(self.now + timedelta(seconds=10)).isoformat())
+        sessions = self.base / ".claude/projects" / log_events.re.sub(r"[^A-Za-z0-9]", "-", job["cwd"])
+        sessions.mkdir(parents=True)
+        rows = [dict(type="user", message=dict(content="PRIVATE PROMPT")),
+                dict(type="assistant", message=dict(content=[dict(type="text", text="Working"),
+                     dict(type="thinking", thinking="Brief title\nPRIVATE thinking"),
+                     dict(type="tool_use", id="read", name="Read", input=dict(file_path="PRIVATE")),
+                     dict(type="tool_use", id="cmd", name="Bash", input=dict(command="pytest"))])),
+                dict(type="user", message=dict(content=[dict(type="tool_result", tool_use_id="read", content="PRIVATE"),
+                     dict(type="tool_result", tool_use_id="cmd", is_error=True, content="Exit code: 2\n1 failed")])),
+                dict(type="attachment", message=dict(content="PRIVATE"))]
+        for row in rows:
+            row["timestamp"] = self.now.isoformat()
+        (sessions / "match.jsonl").write_text("\n".join(json.dumps(row) for row in rows))
+        (sessions / "old.jsonl").write_text(json.dumps(dict(timestamp="2001-01-01T00:00:00Z")))
+        data = log_events.job_events(job, directory)
+        self.assertTrue(data["source"].endswith("match.jsonl"))
+        self.assertNotIn("PRIVATE", json.dumps(data))
+        self.assertEqual([e["kind"] for e in data["events"]], ["start", "say", "think", "cmd", "test", "error"])
+        job["started_at"] = "2002-01-01T00:00:00Z"
+        job["finished_at"] = "2002-01-02T00:00:00Z"
+        self.assertEqual(log_events.job_events(job, directory)["events"], [])
+
+    def test_event_bounds_and_secret_patterns(self):
+        directory = self.worker_dir("bounded-events")
+        path = directory / "log"
+        path.write_text("codex\n" + "x" * (log_events.MAX_BYTES + 10) + "\ncodex\nVisible\n")
+        data = log_events.job_events(dict(pool="codex"), directory)
+        self.assertEqual([e["text"] for e in data["events"]], ["Visible"])
+        self.assertEqual(log_events.redact("Bearer abc ghp_abcdefghijklmnopqrst password=abc secret=x"), "*** *** *** ***")
+        path.write_text("user\nonly prompt\n")
+        self.assertEqual(log_events.job_events(dict(pool="codex"), directory)["events"], [])
+
+    def test_events_route_validation_readonly_and_symlinks(self):
+        self.record("events", "done")
+        directory = self.worker_dir("events")
+        (directory / "log").write_text("codex\nHello\n")
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "log").write_text("codex\nPRIVATE\n")
+        core.remote_dir("linked").symlink_to(outside, target_is_directory=True)
+        self.record("linked", "done")
+        self.record("filelink", "running")
+        (self.worker_dir("filelink") / "log").symlink_to(outside / "log")
+        before = {str(p): (p.stat().st_mtime_ns, p.stat().st_size) for p in self.base.rglob("*")}
+        with patch.object(core, "ensure", side_effect=AssertionError("write")), patch.object(core, "reclaim", side_effect=AssertionError("reclaim")):
+            self.assertEqual(self.request("GET", "/api/jobs/events/events")[0], 200)
+            self.assertEqual(self.request("HEAD", "/api/jobs/events/events")[2], b"")
+            self.assertEqual(self.request("GET", "/api/jobs/missing/events")[0], 404)
+            self.assertEqual(self.request("GET", "/api/jobs/%2e%2e/events")[0], 400)
+            self.assertEqual(self.request("GET", "/api/jobs/a%2Fb/events")[0], 400)
+            self.assertEqual(self.request("GET", "/api/jobs/linked/events")[0], 404)
+            data = json.loads(self.request("GET", "/api/jobs/filelink/events")[2])
+            self.assertEqual(data["events"], [])
+        self.assertEqual(before, {str(p): (p.stat().st_mtime_ns, p.stat().st_size) for p in self.base.rglob("*")})
 
     def test_tick_fresh_errors_are_unhealthy(self):
         logs = self.root / "logs"

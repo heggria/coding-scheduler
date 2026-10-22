@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from affinity import model_for
 import core
 from stats import collect_stats
+from log_events import job_events
 from core import TZ, counts, home, load_jobs, reason_text, remote_dir
 
 TAIL_BYTES = 8192
@@ -19,7 +20,7 @@ LABEL = "com.heggria.cs-tick"
 DIST = Path(__file__).with_name("dashboard_dist")
 CACHE_SECONDS = 2
 JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-LOG_ROUTE = re.compile(r"^/api/jobs/([^/]+)/log$")
+LOG_ROUTE = re.compile(r"^/api/jobs/([^/]+)/(log|events)$")
 LOG_NAMES = ("log", "stdout", "stderr", "conclusion.md")
 LOG_SUFFIXES = (".log", ".out", ".err")
 LOG_TAIL_DEFAULT, LOG_TAIL_MAX = 200, 2000
@@ -246,8 +247,25 @@ def make_server(host, port, status_command=None):
                         if not match:
                             self.respond(404, b"Not found", "text/plain; charset=utf-8")
                             return
-                        count = parse_tail(parts.query)
-                        result = job_logs(unquote(match.group(1)), count)
+                        jid = unquote(match.group(1))
+                        if match.group(2) == "events":
+                            if not JOB_ID.fullmatch(jid) or ".." in jid:
+                                raise BadRequest("bad job id")
+                            directory = remote_dir(jid)
+                            result = None
+                            if directory.resolve().parent == directory.parent.resolve() and directory.is_dir():
+                                root = home().resolve()
+                                for folder in ("queue", "running", "done"):
+                                    record = root / folder / (jid + ".json")
+                                    if record.resolve().parent != root / folder:
+                                        continue
+                                    job = next((j for j in load_jobs(root, folder)
+                                                if isinstance(j, dict) and j.get("id") == jid), None)
+                                    if job:
+                                        result = job_events(job, directory)
+                                        break
+                        else:
+                            result = job_logs(jid, parse_tail(parts.query))
                     except BadRequest as error:
                         body = json.dumps({"error": str(error)}).encode("utf-8")
                         self.respond(400, body, "application/json; charset=utf-8")

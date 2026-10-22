@@ -95,3 +95,17 @@ export interface Row {
   /** Normalised status: running | queued | done | failed | blocked | cancelled | unknown */
   kind: string;
 }
+
+export interface JobEvent {
+  ts?: string | number;
+  kind: "start" | "say" | "think" | "cmd" | "edit" | "test" | "error" | "end";
+  text: string;
+  exit?: number;
+  files?: string[];
+}
+export interface EventsPayload {
+  source: string | null;
+  pool: string;
+  events: JobEvent[];
+  note?: string;
+}

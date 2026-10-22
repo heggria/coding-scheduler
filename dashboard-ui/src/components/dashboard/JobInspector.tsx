@@ -15,7 +15,7 @@ import {
 } from "@/lib/derive";
 import { StatusBadge } from "./JobTable";
 import { ReasonList } from "./ReasonList";
-import type { Row } from "@/types";
+import type { JobEvent, EventsPayload, Row } from "@/types";
 
 type Tab = "overview" | "log" | "reasons";
 
@@ -154,6 +154,79 @@ function LogViewer({ id, running, fallback }: { id: string; running: boolean; fa
         </>
       )}
       {updated > 0 && <p className="muted small">读取于 {clock(updated)}</p>}
+    </div>
+  );
+}
+
+function ProcessViewer({ id, running, fallback }: { id: string; running: boolean; fallback?: string | null }) {
+  const [raw, setRaw] = useState(false);
+  const [events, setEvents] = useState<JobEvent[]>([]);
+  const [note, setNote] = useState("");
+  const pane = useRef<HTMLDivElement>(null);
+  const stick = useRef(true);
+  useEffect(() => {
+    setRaw(false);
+    setEvents([]);
+    setNote("");
+    stick.current = true;
+  }, [id]);
+  useEffect(() => {
+    if (raw) return;
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let controller: AbortController | undefined;
+    async function load() {
+      controller = new AbortController();
+      const timeout = setTimeout(() => controller?.abort(), 8000);
+      try {
+        const response = await fetch(`./api/jobs/${encodeURIComponent(id)}/events`, {
+          signal: controller.signal, cache: "no-store",
+        });
+        if (!response.ok) throw new Error(`过程接口 HTTP ${response.status}`);
+        const next = (await response.json()) as EventsPayload;
+        if (!Array.isArray(next.events) || !next.events.length)
+          throw new Error(next.note || "暂无可解析的执行过程");
+        if (active) { setEvents(next.events); setNote(""); }
+      } catch (error) {
+        if (active) {
+          setNote(`${error instanceof Error ? error.message : "过程读取失败"}，已显示原始日志。`);
+          setRaw(true);
+        }
+      } finally {
+        clearTimeout(timeout);
+        if (active && running) timer = setTimeout(load, LOG_POLL_MS);
+      }
+    }
+    void load();
+    return () => { active = false; controller?.abort(); clearTimeout(timer); };
+  }, [id, running, raw]);
+  useEffect(() => {
+    if (pane.current && stick.current) pane.current.scrollTop = pane.current.scrollHeight;
+  }, [events, raw]);
+  return (
+    <div className="log-viewer">
+      <div className="process-toggle" role="group" aria-label="日志显示方式">
+        <button type="button" aria-pressed={!raw} onClick={() => { setRaw(false); setNote(""); }}>重要过程</button>
+        <button type="button" aria-pressed={raw} onClick={() => { setRaw(true); setNote(""); }}>原始日志</button>
+      </div>
+      {note && <p className="muted" role="status">{note}</p>}
+      {raw ? <LogViewer id={id} running={running} fallback={fallback} /> : <>
+        {running && <p className="muted small">运行中，每 3 秒刷新</p>}
+        {!events.length && <p className="muted">正在读取过程…</p>}
+        <div className="process-events" ref={pane} onScroll={() => {
+          const el = pane.current;
+          if (el) stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+        }}>
+          {events.map((event, index) => (
+            <div key={index} className={cn("process-event", (event.kind === "error" || (event.exit != null && event.exit !== 0)) && "process-error")}>
+              <small className="badge">{event.kind}</small>
+              {event.ts != null && <small className="muted">{typeof event.ts === "number" ? clock(event.ts) : event.ts}</small>}
+              {event.kind === "cmd" && event.exit != null && <small>exit {event.exit}</small>}
+              <pre>{event.text}</pre>
+            </div>
+          ))}
+        </div>
+      </>}
     </div>
   );
 }
@@ -299,7 +372,7 @@ export function JobInspector({
         )}
         {tab === "log" && (
           <>
-            <LogViewer id={j.id} running={row.kind === "running"} fallback={j.log_last_line} />
+            <ProcessViewer key={j.id} id={j.id} running={row.kind === "running"} fallback={j.log_last_line} />
             <h5>日志路径</h5>
             <PathLine value={j.log} />
           </>

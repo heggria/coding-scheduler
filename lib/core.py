@@ -174,7 +174,8 @@ def retry_transient(root, original):
             original["retry_error"] = "original prompt unavailable; submit a new job explicitly"
             return None
     fields = ("project", "area", "tier", "cwd", "risk", "pin", "read_only", "files",
-              "shared_files", "no_template", "user_prompt", "review_of", "context_text")
+              "shared_files", "no_template", "user_prompt", "review_of", "context_text",
+              "resume_of", "resume_session_id")
     job = {key: original[key] for key in fields if key in original}
     job.setdefault("files", [])
     job.setdefault("shared_files", [])
@@ -960,6 +961,15 @@ def reclaim(root):
             job["exit"] = None
         if idle_timeout:
             job["exit"] = 1
+        if job.get("pool") == "codex":
+            try:
+                with (remote_dir(job["id"]) / "log").open("rb") as stream:
+                    header = stream.read(4096).decode("utf-8", errors="replace")
+                session = re.search(r"^session id: ([0-9a-fA-F-]{36})$", header, re.MULTILINE)
+                if session:
+                    job["codex_session_id"] = session.group(1)
+            except OSError:
+                pass
         conc = remote_dir(job["id"]) / "conclusion.md"
         if not conc.exists():
             conc = conc.with_suffix(".txt")  # Already running legacy workers.
@@ -1066,7 +1076,13 @@ def launch(root, job, pool):
         # worker wrote itself (as the prompt instructs) is never overwritten; the final
         # message only fills in when the worker wrote none. The worker exit code is kept.
         last = jd / "last-message.md"
-        if pool == "codex":
+        if pool == "codex" and job.get("resume_session_id"):
+            job["codex_session_id"] = job["resume_session_id"]
+            command = ("codex exec resume --dangerously-bypass-approvals-and-sandbox -m %s "
+                       "-c %s -o %s %s - < %s || w_rc=$?\n" %
+                       (q(model), q("model_reasoning_effort=" + effort), q(str(last)),
+                        q(job["resume_session_id"]), q(str(prompt_on_disk))))
+        elif pool == "codex":
             command = ("codex exec --dangerously-bypass-approvals-and-sandbox -m %s "
                        "-c %s -C %s -o %s - < %s || w_rc=$?\n" %
                        (q(model), q("model_reasoning_effort=" + effort), q(cwd),
@@ -1086,11 +1102,12 @@ def launch(root, job, pool):
                         q(extract), q(str(events)), q(str(last))))
         else:
             cc_effort = "high" if effort == "medium" else effort
-            job["cc_session_id"] = str(uuid.uuid4())
+            job["cc_session_id"] = job.get("resume_session_id") or str(uuid.uuid4())
             write_job(root, "queue", job)
-            command = ("claude -p --dangerously-skip-permissions --model %s --effort %s --session-id %s "
+            command = ("claude -p --dangerously-skip-permissions --model %s --effort %s %s %s "
                        '\"$(cat %s)\" > %s || w_rc=$?\n' %
-                       (q(model), q(cc_effort), q(job["cc_session_id"]), q(str(prompt_on_disk)), q(str(last))))
+                       (q(model), q(cc_effort), "--resume" if job.get("resume_session_id") else "--session-id",
+                        q(job["cc_session_id"]), q(str(prompt_on_disk)), q(str(last))))
         command = ("w_rc=0\n" + command +
                    "if [ ! -s %s ] && [ -s %s ]; then cp %s %s; fi\n" % (
                        q(str(conclusion)), q(str(last)), q(str(last)), q(str(conclusion))) +

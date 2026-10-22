@@ -421,6 +421,66 @@ class SchedulerTests(unittest.TestCase):
             self.submit("nested-ok", "--allow-nested", "--prompt-text", "x")
         self.assertIsNotNone(core.find_job(self.root, "nested-ok"))
 
+    def test_reclaim_codex_session_header(self):
+        sid = "12345678-abcd-1234-abcd-123456789abc"
+        for index, header in enumerate(("banner\nsession id: " + sid + "\n", "invalid",
+                                        "x" * 4096 + "\nsession id: " + sid + "\n", None)):
+            jid = "header-" + str(index)
+            self.record(jid, "running", pool="codex")
+            worker = core.remote_dir(jid)
+            worker.mkdir(parents=True)
+            (worker / "exit").write_text("0")
+            (worker / "conclusion.md").write_text("STATUS: DONE")
+            if header is not None:
+                (worker / "log").write_text(header)
+            core.reclaim(self.root)
+            self.assertEqual(core.find_job(self.root, jid).get("codex_session_id"), sid if index == 0 else None)
+
+    def test_resume_submit_and_launch_commands(self):
+        sid = "12345678-abcd-1234-abcd-123456789abc"
+        for pool in ("codex", "cc"):
+            key = "codex_session_id" if pool == "codex" else "cc_session_id"
+            self.record("original-" + pool, "done", pool=pool, **{key: sid})
+            self.submit("resume-" + pool, "--prompt-text", "fix", "--resume-of", "original-" + pool,
+                        "--cwd", str(self.cwd / ".." / self.cwd.name), "--model", "custom model")
+            job = core.find_job(self.root, "resume-" + pool)
+            self.assertEqual((job["pin"], job["resume_of"], job["resume_session_id"]),
+                             (pool, "original-" + pool, sid))
+            with patch.dict(os.environ, {"CS_TEST_FAKE_WORKER": "0"}), \
+                    patch.object(core, "git_output", return_value=None), \
+                    patch.object(core.subprocess, "Popen", return_value=Mock(pid=123)):
+                core.launch(self.root, job, pool)
+            script = (core.remote_dir(job["id"]) / "run.sh").read_text()
+            self.assertEqual(core.find_job(self.root, job["id"])[key], sid)
+            for token in (("codex exec resume", sid, "-m 'custom model'", "-o ", "-c model_reasoning_effort=")
+                          if pool == "codex" else ("--resume " + sid, "--model 'custom model'")):
+                self.assertIn(token, script)
+            self.assertNotIn("-C ", script)
+            self.assertNotIn("--session-id", script)
+            retry = core.find_job(self.root, core.retry_transient(self.root, job))
+            self.assertEqual((retry["resume_of"], retry["resume_session_id"]), (job["resume_of"], sid))
+
+    def test_resume_rejects_invalid_originals(self):
+        sid = "12345678-abcd-1234-abcd-123456789abc"
+        cases = (("missing", {}, (), "not found"),
+                 ("running", {"status": "running"}, (), "原单未结束"),
+                 ("queued", {"status": "queued"}, (), "原单未结束"),
+                 ("cwd", {"cwd": str(self.base)}, (), "cwd must match"),
+                 ("pin", {}, ("--pin", "cc"), "pin must match"),
+                 ("opencode", {"pool": "opencode"}, (), "opencode 不支持 resume"),
+                 ("empty-pool", {"pool": None}, (), "opencode 不支持 resume"),
+                 ("review", {}, ("--area", "review", "--files", "review.md"), "评审单不用 resume"),
+                 ("no-session", {"codex_session_id": None}, (), "原单没有会话 id"))
+        for name, overrides, flags, message in cases:
+            with self.subTest(name=name):
+                if name != "missing":
+                    self.record(name, "done", **dict(dict(pool="codex", codex_session_id=sid), **overrides))
+                result = self.submit("reject-" + name, "--prompt-text", "fix", "--resume-of", name,
+                                     *flags, expected=2)
+                self.assertIn(message, result["error"])
+                self.assertIsNone(core.find_job(self.root, "reject-" + name))
+                self.assertFalse((self.root / "queue" / ("reject-" + name + ".prompt.md")).exists())
+
     def test_cc_session_id_and_worker_git_identity(self):
         near = "heggriax\0other@example.invalid\nOther\0heggria@example.invalid\nheggria\0"
         for pool in ("cc", "codex", "opencode"):

@@ -128,6 +128,26 @@ def cmd_submit(args):
     cwd = Path(args.cwd).expanduser().resolve()
     if not cwd.is_dir():
         return error(args, "cwd is not a directory: " + str(cwd))
+    resume = None
+    if getattr(args, "resume_of", None):
+        original = find_job(root, args.resume_of)
+        if original is None:
+            return error(args, "not found: " + args.resume_of)
+        if original.get("status") in ("queued", "running"):
+            return error(args, "原单未结束")
+        if args.area == "review":
+            return error(args, "评审单不用 resume")
+        pool = original.get("pool")
+        if pool not in ("codex", "cc"):
+            return error(args, "opencode 不支持 resume")
+        if cwd != Path(original["cwd"]).expanduser().resolve():
+            return error(args, "resume cwd must match original cwd")
+        if args.pin and args.pin != pool:
+            return error(args, "resume pin must match original pool")
+        sid = original.get("codex_session_id" if pool == "codex" else "cc_session_id")
+        if not sid:
+            return error(args, "原单没有会话 id")
+        args.pin, resume = pool, sid
     if args.prompt_text is not None:
         body = args.prompt_text
     elif args.prompt == "-":
@@ -154,6 +174,8 @@ def cmd_submit(args):
     }
     if getattr(args, "retry_of", None):
         job["retry_of"] = args.retry_of
+    if resume:
+        job.update(resume_of=args.resume_of, resume_session_id=resume)
     if args.review_of:
         job["review_of"] = args.review_of
     try:
@@ -447,6 +469,7 @@ def main():
     s.add_argument("--model", default=None)
     s.add_argument("--idempotency-key", default=None)
     s.add_argument("--pin", choices=["codex", "cc", "opencode"], default=None)
+    s.add_argument("--resume-of", type=identifier, default=None)
     s.add_argument("--risk", choices=["low", "high"], default="low")
     s.add_argument("--files", default="", help="comma-separated exact output/writable file paths, including review docs; empty only with --area research --read-only (directory paths warn)")
     s.add_argument("--lock-shared", default="", help="comma-separated exact resource paths")

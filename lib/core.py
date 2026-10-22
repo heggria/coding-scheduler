@@ -1059,9 +1059,10 @@ def launch(root, job, pool):
                 "; mv " + q(str(exit_file) + ".tmp") + " " + q(str(exit_file)))
         git_env = ""
         if not git_output(cwd, "config", "user.email"):
-            author = (git_output(cwd, "log", "-1", "--author=" + pwd.getpwuid(os.getuid()).pw_name,
-                                 "--format=%an%n%ae") or "").splitlines()
-            if len(author) == 2 and all(author):
+            author = next((line.split("\0", 1) for line in (git_output(
+                cwd, "log", "-n", "200", "--format=%an%x00%ae") or "").splitlines()
+                if line.partition("\0")[0] == pwd.getpwuid(os.getuid()).pw_name and line.partition("\0")[2]), None)
+            if author:
                 git_env = "export " + " ".join(key + "=" + q(value) for key, value in (
                     ("GIT_AUTHOR_NAME", author[0]), ("GIT_AUTHOR_EMAIL", author[1]),
                     ("GIT_COMMITTER_NAME", author[0]), ("GIT_COMMITTER_EMAIL", author[1]))) + "\n"

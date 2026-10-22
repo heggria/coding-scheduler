@@ -360,21 +360,29 @@ class SchedulerTests(unittest.TestCase):
         self.assertIsNotNone(core.find_job(self.root, "nested-ok"))
 
     def test_cc_session_id_and_worker_git_identity(self):
+        near = "heggriax\0other@example.invalid\nOther\0heggria@example.invalid\nheggria\0"
         for pool in ("cc", "codex", "opencode"):
-            for email in (None, "", "configured@example.invalid"):
+            for email, history in ((None, ""), ("configured@example.invalid", ""), ("", ""), ("", near),
+                                   ("", near + "\nheggria\0x@example.invalid")):
                 with self.subTest(pool=pool, email=email):
                     self.submit("identity", "--prompt-text", "fixture")
                     job = core.find_job(self.root, "identity")
                     def git_output(cwd, *args):
                         if email is None:
                             return None
-                        return email if args == ("config", "user.email") else "heggria\nx@example.invalid"
+                        if args == ("config", "user.email"):
+                            return email
+                        if args == ("rev-parse", "HEAD"):
+                            return None
+                        self.assertEqual(args, ("log", "-n", "200", "--format=%an%x00%ae"))
+                        return history
                     def spawn(*args, **kwargs):
                         if pool == "cc":
                             self.assertEqual(core.load_jobs(self.root, "queue")[0]["cc_session_id"], job["cc_session_id"])
                         return Mock(pid=123)
                     with patch.dict(os.environ, {"CS_TEST_FAKE_WORKER": "0"}), \
                             patch.object(core, "git_output", side_effect=git_output) as git, \
+                            patch.object(core.pwd, "getpwuid", return_value=Mock(pw_name="heggria")), \
                             patch.object(core.subprocess, "Popen", side_effect=spawn):
                         core.launch(self.root, job, pool)
                     worker = core.remote_dir(job["id"])
@@ -386,7 +394,8 @@ class SchedulerTests(unittest.TestCase):
                         self.assertEqual(core.find_job(self.root, "identity")["cc_session_id"], job["cc_session_id"])
                     for key, value in (("AUTHOR_NAME", "heggria"), ("AUTHOR_EMAIL", "x@example.invalid"),
                                        ("COMMITTER_NAME", "heggria"), ("COMMITTER_EMAIL", "x@example.invalid")):
-                        self.assertEqual("GIT_" + key + "=" + value in script, email == "")
+                        self.assertEqual("GIT_" + key + "=" + value in script, history.endswith("x@example.invalid"))
+                    self.assertEqual("export GIT_" in script, history.endswith("x@example.invalid"))
                     self.assertEqual(any(call.args[1] == "log" for call in git.call_args_list), not bool(email))
                     core.remove_job(self.root, "running", "identity")
 

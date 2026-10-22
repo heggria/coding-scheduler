@@ -152,7 +152,13 @@ def submission_prompt(root, job):
     body = declaration + "\n\n" + job["user_prompt"]
     template = root / "projects" / (job["project"] + ".md")
     if not job.get("no_template") and template.is_file():
-        body = template.read_text().rstrip() + "\n\n" + body
+        text = template.read_text().rstrip()
+        if "context_text" in job:
+            text = text.replace("先读 README.md、DESIGN.md、BACKLOG.md 和目标代码，再做最小改动。",
+                                "预读上下文已附，仅在不够时再读 README.md、DESIGN.md、BACKLOG.md 和目标代码；做最小改动。")
+        body = text + "\n\n" + body
+    if "context_text" in job:
+        body += "\n\n## 预读上下文\n\n" + job["context_text"]
     return body
 
 
@@ -168,7 +174,7 @@ def retry_transient(root, original):
             original["retry_error"] = "original prompt unavailable; submit a new job explicitly"
             return None
     fields = ("project", "area", "tier", "cwd", "risk", "pin", "read_only", "files",
-              "shared_files", "no_template", "user_prompt", "review_of")
+              "shared_files", "no_template", "user_prompt", "review_of", "context_text")
     job = {key: original[key] for key in fields if key in original}
     job.setdefault("files", [])
     job.setdefault("shared_files", [])

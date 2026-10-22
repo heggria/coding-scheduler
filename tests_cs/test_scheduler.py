@@ -551,6 +551,65 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual((self.root / "queue/off.prompt.md").read_text(),
                          declaration + "\n\n" + policy_text("companion") + "\n\nraw")
 
+    def test_context_prompt_template_and_retries(self):
+        rule = "先读 README.md、DESIGN.md、BACKLOG.md 和目标代码，再做最小改动。"
+        (self.root / "projects/fixture.md").write_text("- " + rule + "\n")
+        source, absolute = self.cwd / "notes.md", self.base / "absolute.md"
+        source.write_text("one\n二\nthree\n")
+        absolute.write_text("absolute\nlast")
+        with patch.dict(os.environ, {"HOME": str(self.base)}):
+            self.assertEqual(CLI["context_text"](self.cwd, ["~/absolute.md"]),
+                             "### ~/absolute.md:1-2\nabsolute\nlast")
+        self.submit("context", "--prompt-text", rule, "--context", "notes.md:2-3",
+                    "--context", str(absolute))
+        job = core.find_job(self.root, "context")
+        expected = "### notes.md:2-3\n二\nthree\n\n\n### %s:1-2\nabsolute\nlast" % absolute
+        self.assertEqual(job["context_text"], expected)
+        prompt = Path(job["prompt_file"]).read_text()
+        self.assertTrue(prompt.endswith("\n\n## 预读上下文\n\n" + expected))
+        self.assertIn("- 预读上下文已附，仅在不够时再读", prompt)
+        self.assertIn("\n\n" + rule + "\n\n", prompt)  # Only the template changes.
+        self.submit("plain", "--prompt-text", "goal")
+        self.assertTrue((self.root / "queue/plain.prompt.md").read_text().startswith("- " + rule))
+        self.assertNotIn("context_text", core.find_job(self.root, "plain"))
+        self.cli("cancel", "context", "--json")
+        source.unlink()
+        absolute.unlink()
+        retried = json.loads(self.cli("retry", "context", "--json"))
+        automatic = core.retry_transient(self.root, job)
+        for jid in (retried["id"], automatic):
+            clone = core.find_job(self.root, jid)
+            self.assertEqual(clone["context_text"], expected)
+            self.assertTrue(Path(clone["prompt_file"]).read_text().endswith(expected))
+
+    def test_context_rejects_invalid_sensitive_paths_and_size_without_queueing(self):
+        source = self.cwd / "notes.md"
+        source.write_text("ok\n")
+        sensitive = [".env", ".env.local", ".ssh/x", ".gnupg/x", ".aws/x", "auth.json",
+                     ".npmrc", ".netrc", ".pypirc", "credentials", "id_rsa.pub", "id_ed25519.x"]
+        for name in sensitive:
+            path = self.cwd / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("secret")
+        (self.cwd / "alias").symlink_to(self.cwd / ".env")
+        for index, spec in enumerate(sensitive + ["alias", "missing", ".", "", "notes.md:0-1",
+                                                  "notes.md:2-1", "notes.md:-1-2", "notes.md:1-x"]):
+            with self.subTest(spec=spec):
+                self.assertIn("error", self.submit("bad%d" % index, "--prompt-text", "goal",
+                                                  "--context", spec, expected=2))
+        source.write_text("中" * 22000)
+        result = self.submit("large", "--prompt-text", "goal", "--context", "notes.md", expected=2)
+        self.assertIn("line ranges", result["error"])
+        self.assertEqual(list((self.root / "queue").iterdir()), [])
+        source.write_text("x" * (CLI["CONTEXT_LIMIT"] - len("### notes.md:1-1\n")))
+        self.assertEqual(len(CLI["context_text"](self.cwd, ["notes.md"]).encode()), 65536)
+        with self.assertRaisesRegex(ValueError, "line ranges"):
+            CLI["context_text"](self.cwd, ["notes.md", "notes.md"])
+        with patch.object(Path, "home", return_value=self.base):
+            for name in (".codex/nested/data.json", ".claude/data.json"):
+                with self.assertRaisesRegex(ValueError, "credential"):
+                    CLI["context_text"](self.cwd, [str(self.base / name)])
+
     def test_submit_declaration_for_write_read_only_and_no_template(self):
         (self.root / "projects/fixture.md").write_text("project rules\n")
         cases = [

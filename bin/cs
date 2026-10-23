@@ -347,6 +347,7 @@ def cmd_cancel(args):
         job.update(status="cancelled", finished_at=datetime.now(TZ).isoformat(), queue_reasons=[])
         if args.superseded_by:
             job["superseded_by"] = args.superseded_by
+        job["cancel_reason"] = args.reason or ("superseded" if args.superseded_by else "operator")
         write_job(root, "done", job)
         remove_job(root, folder, args.id)
         core.log_event(root, dict(job, queue_reasons=queue_reasons))
@@ -354,7 +355,8 @@ def cmd_cancel(args):
         if args.json:
             emit({"job": job_summary(job), "superseded_by": args.superseded_by})
         else:
-            print("cancelled " + args.id + (" superseded_by=" + args.superseded_by if args.superseded_by else ""))
+            print("cancelled " + args.id + " reason=" + job["cancel_reason"] +
+                  (" superseded_by=" + args.superseded_by if args.superseded_by else ""))
         return 0
     return error(args, "not found: " + args.id, 1)
 
@@ -510,6 +512,8 @@ def main():
     c = sp.add_parser("cancel", help="cancel queued or running job")
     c.add_argument("id", type=identifier)
     c.add_argument("--superseded-by", default=None)
+    c.add_argument("--reason", choices=("operator", "superseded", "wrong-prompt", "batch-abort", "infra"),
+                   default=None, help="why it was cancelled (default: superseded if --superseded-by, else operator)")
     c.set_defaults(func=cmd_cancel)
     b = sp.add_parser("board", help="rewrite board.md")
     b.set_defaults(func=cmd_board)

@@ -16,9 +16,14 @@ from pathlib import Path
 LIB = Path(__file__).resolve().parents[1] / "lib"
 CONTEXT_LIMIT = 65536
 sys.path.insert(0, str(LIB))
+# Read-only advice must not create Python cache files either.
+if next((arg for arg in sys.argv[1:] if arg != "--json"), None) == "advise":
+    sys.dont_write_bytecode = True
 
 from locks import directory_locks, file_conflict, lock_context
 from scope import narrow_warnings
+from narrow import candidate_warnings, retry_delta
+from handoff import render_handoff
 import core
 from core import (TZ, check_queue, counts, doctor_checks, ensure, find_job, home,
                   job_summary, kill_worker_group, load_jobs, reason_text, reclaim, remove_job,
@@ -133,21 +138,13 @@ def cmd_submit(args):
         original = find_job(root, args.resume_of)
         if original is None:
             return error(args, "not found: " + args.resume_of)
-        if original.get("status") in ("queued", "running"):
-            return error(args, "原单未结束")
-        if args.area == "review":
-            return error(args, "评审单不用 resume")
+        resume = core.resume_session(original, args.area)
         pool = original.get("pool")
-        if pool not in ("codex", "cc"):
-            return error(args, "opencode 不支持 resume")
         if cwd != Path(original["cwd"]).expanduser().resolve():
             return error(args, "resume cwd must match original cwd")
         if args.pin and args.pin != pool:
             return error(args, "resume pin must match original pool")
-        sid = original.get("codex_session_id" if pool == "codex" else "cc_session_id")
-        if not sid:
-            return error(args, "原单没有会话 id")
-        args.pin, resume = pool, sid
+        args.pin = pool
     if args.prompt_text is not None:
         body = args.prompt_text
     elif args.prompt == "-":
@@ -174,19 +171,31 @@ def cmd_submit(args):
     }
     if getattr(args, "retry_of", None):
         job["retry_of"] = args.retry_of
+        job["run_delta"] = args.run_delta
     if resume:
         job.update(resume_of=args.resume_of, resume_session_id=resume)
+        for field in ("context_text", "context_snapshot"):
+            if field in original:
+                job[field] = original[field]
     if args.review_of:
         job["review_of"] = args.review_of
     try:
-        context = context_text(cwd, args.context) if getattr(args, "context", None) else getattr(args, "stored_context_text", None)
+        specs = getattr(args, "context", None)
+        context = context_text(cwd, specs) if specs else getattr(args, "stored_context_text", None)
+        snapshot = core.capture_context_snapshot(cwd, specs) if specs else getattr(args, "stored_context_snapshot", None)
         if context is not None:
             job["context_text"] = context
+            job.pop("context_snapshot", None)
+            if snapshot is not None:
+                job["context_snapshot"] = snapshot
     except (OSError, ValueError, RuntimeError) as exc:
         return error(args, str(exc))
+    core.check_context_freshness(job)
     prompt_dst.write_text(core.submission_prompt(root, job))
     job["lock_ctx"] = lock_context(job)
     others = load_jobs(root, "running") + load_jobs(root, "queue")
+    known = core.git_output(cwd, "ls-files", "--cached", "--others", "--exclude-standard", "-z")
+    job["warnings"].extend(candidate_warnings(job, others, (known or "").split("\0")))
     # Warn only about existing shared locks, using the scheduler's repo/path rules.
     shared_jobs = [dict(other, files=[], lock_ctx=None) for other in others if other.get("shared_files")]
     for conflict in file_conflict(job, shared_jobs):
@@ -244,11 +253,27 @@ def cmd_retry(args):
         files=",".join(files), lock_shared=",".join(merge(original.get("shared_files") or [], args.add_shared)),
         prompt_text=original["user_prompt"], prompt=None, no_template=original.get("no_template", False),
         context=None, stored_context_text=original.get("context_text"),
+        stored_context_snapshot=original.get("context_snapshot"),
+        run_delta=retry_delta(original, args.run_delta),
         scope_policy=args.scope_policy or original.get("scope_policy", "strict"),
         id=None, review_of=original.get("review_of"), retry_of=original["id"],
         idempotency_key=args.idempotency_key, tick=args.tick, json=args.json,
         allow_nested=args.allow_nested)
     return cmd_submit(submit_args)
+
+
+def cmd_notify(args):
+    from notify import drain
+    channel = args.channel or os.environ.get("CS_NOTIFY_CHANNEL", "off")
+    stream = sys.stderr if args.json else sys.stdout
+    result = drain(home(), channel, lambda text: print(text, file=stream, flush=True))
+    if args.json:
+        emit(result)
+    elif not result["enabled"]:
+        print("本地通知未启用；指定 --channel terminal 或 inbox")
+    for failure in result["errors"]:
+        print(failure, file=sys.stderr)
+    return 1 if result["errors"] else 0
 
 
 def cmd_tick(args):
@@ -274,15 +299,13 @@ def cmd_status(args):
         if args.json:
             emit({"job": summary})
         else:
-            print("[%s] %s exit=%s elapsed=%ss" % (summary["status"], args.id,
-                  summary["exit"], summary["elapsed_seconds"]))
-            print(summary.get("reason_text") or reason_text(summary["queue_reasons"]))
+            print(render_handoff(summary["handoff"], args.id))
+            if summary["queue_reasons"]:
+                print(reason_text(summary["queue_reasons"]))
             if "line_stat" in summary:
                 stat, limit = summary["line_stat"], summary.get("max_added_lines")
                 print("业务代码 +%d/-%d（%d 文件）%s" % (stat["added"], stat["deleted"], stat["files"],
                       " 超上限 %d" % limit if limit is not None and stat["added"] > limit else ""))
-            print("\n".join(summary["conclusion"]))
-            print(json.dumps(summary["artifacts"], ensure_ascii=False))
         return 0
     running, queued = core.observe_running(load_jobs(root, "running")), load_jobs(root, "queue")
     c = counts(running)
@@ -325,7 +348,13 @@ def cmd_wait(args):
             timed_out = not finished and deadline is not None and time.monotonic() >= deadline
             if finished or timed_out:
                 write_board(root)
-                emit({"timed_out": timed_out, "jobs": [job_summary(job, args.lines) for job in jobs]})
+                summaries = [job_summary(job, args.lines) for job in jobs]
+                if getattr(args, "text", False) and not args.json:
+                    print("\n\n".join(render_handoff(job["handoff"], job["id"]) for job in summaries))
+                    if timed_out:
+                        print("wait 超时；调度状态保持原值。")
+                else:
+                    emit({"timed_out": timed_out, "jobs": summaries})
                 return 124 if timed_out else 0
         remaining = None if deadline is None else deadline - time.monotonic()
         time.sleep(0.2 if remaining is None else max(0, min(0.2, remaining)))
@@ -371,15 +400,21 @@ def cmd_board(args):
 
 
 def cmd_doctor(args):
+    from doctor_caps import doctor_capabilities
     root = ensure()
     checks = doctor_checks(args.cwd, args.pool)
+    capabilities = doctor_capabilities(checks, args.pool)
     failed = any(c["level"] == "FAIL" for c in checks)
     if args.json:
-        emit({"home": str(root), "board": (root / "board.md").exists(), "checks": checks})
+        emit({"home": str(root), "board": (root / "board.md").exists(), "checks": checks,
+              "cwd": str(Path(args.cwd).expanduser().resolve()) if args.cwd else None,
+              "pool": args.pool, "capabilities": capabilities})
     else:
         print("HOME=" + str(root))
         for check in checks:
             print("%s\t%s\t%s" % (check["level"], check["name"], check["detail"]))
+        for name, evidence in capabilities.items():
+            print("%s\t%s\t%s" % (evidence["status"], name, evidence["detail"]))
     return 1 if failed else 0
 
 
@@ -445,6 +480,35 @@ def cmd_cleanup(args):
     return 0
 
 
+def cmd_advise(args):
+    from advise import advise
+    capabilities = None
+    if args.doctor_report:
+        try:
+            report = json.loads(Path(args.doctor_report).read_text())
+            if (not isinstance(report, dict) or report.get("pool") != "codex"
+                    or report.get("cwd") != str(Path(args.cwd).expanduser().resolve())):
+                raise ValueError("doctor report must match cwd and suggested pool codex")
+            from doctor_caps import normalize_capabilities
+            capabilities = normalize_capabilities(report.get("capabilities"))
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            return error(args, "invalid doctor report: " + str(exc))
+    result = advise(args.cwd, args.prompt_text, args.area, args.files, args.read_only,
+                    args.project, args.tier, args.idempotency_key, capabilities=capabilities)
+    if args.json:
+        emit(result)
+    else:
+        print("recommendation: " + result["recommendation"])
+        for field in ("reasons", "missing"):
+            print(field + (":" if result[field] else ": []"))
+            for item in result[field]:
+                print("- " + item)
+        print("capabilities: " + json.dumps(result["capabilities"], ensure_ascii=False))
+        print("\nbrief_draft:\n" + result["brief_draft"])
+        print("\nsuggested_command:\n" + (result["suggested_command"] or "null"))
+    return 0
+
+
 class Parser(argparse.ArgumentParser):
     def error(self, message):
         if "--json" in sys.argv:
@@ -457,6 +521,18 @@ def main():
     ap = Parser(prog="cs", description="Lightweight coding scheduler CLI (no daemon)")
     ap.add_argument("--json", action="store_true")
     sp = ap.add_subparsers(dest="cmd", required=True)
+    a = sp.add_parser("advise", help="print read-only dispatch advice and a Brief draft (never enqueue)")
+    a.add_argument("--cwd", required=True)
+    a.add_argument("--prompt-text", required=True, help="request or Agent Brief to check with cs-dispatch DoR rules")
+    from advise import AREAS
+    a.add_argument("--area", choices=AREAS, default="backend")
+    a.add_argument("--files", default=None, help="comma-separated exact files; otherwise read Files from the Brief")
+    a.add_argument("--read-only", action="store_true", help="empty files allowed only for research")
+    a.add_argument("--project", type=identifier, help="default: sanitized cwd directory name")
+    a.add_argument("--tier", choices=["L", "M", "H"], default="M")
+    a.add_argument("--idempotency-key", help="default: stable hash of cwd, area, scope and request")
+    a.add_argument("--doctor-report", help="read a doctor JSON snapshot for the same cwd and pool codex; no probes")
+    a.set_defaults(func=cmd_advise)
     s = sp.add_parser("submit", help="enqueue a job")
     s.add_argument("--project", required=True, type=identifier)
     s.add_argument("--area", required=True, choices=["backend", "protocol", "frontend", "ui-copy", "test", "review", "ops-script", "research"])
@@ -489,11 +565,19 @@ def main():
     r.add_argument("--add-files", default="")
     r.add_argument("--add-shared", default="")
     r.add_argument("--use-need-files", action="store_true")
+    r.add_argument("--run-delta", help="additional execution decisions, failed attempts or verification evidence")
     r.add_argument("--allow-nested", action="store_true", help="allow retry from inside a cs job")
     r.add_argument("--scope-policy", choices=["strict", "companion", "flex"], default=None)
     r.add_argument("--idempotency-key", default=None)
     r.add_argument("--tick", action="store_true")
     r.set_defaults(func=cmd_retry)
+
+    notify = sp.add_parser("notify", help="deliver local terminal notifications (no Feishu)")
+    notify_commands = notify.add_subparsers(dest="notify_command", required=True)
+    drain = notify_commands.add_parser("drain", help="drain recorded terminal events; does not reclaim workers")
+    drain.add_argument("--channel", choices=["off", "terminal", "inbox"])
+    drain.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    drain.set_defaults(func=cmd_notify)
 
     t = sp.add_parser("tick", help="reclaim finished + start free slots")
     t.set_defaults(func=cmd_tick)
@@ -508,6 +592,7 @@ def main():
     w.add_argument("--timeout", type=nonnegative, default=None)
     w.add_argument("--lines", type=line_count, default=20)
     w.add_argument("--tick", action="store_true", help="advance the scheduler while waiting")
+    w.add_argument("--text", action="store_true", help="render handoff cards (default remains JSON; --json takes precedence)")
     w.set_defaults(func=cmd_wait)
     c = sp.add_parser("cancel", help="cancel queued or running job")
     c.add_argument("id", type=identifier)
@@ -541,11 +626,11 @@ def main():
     cleanup = sp.add_parser("cleanup", help="list old cleanup candidates without deleting")
     cleanup.add_argument("--days", type=line_count, default=7)
     cleanup.set_defaults(func=cmd_cleanup)
-    for parser in (s, r, t, st, w, c, b, d, stats, pool, rc, cleanup):
+    for parser in (a, s, r, notify, t, st, w, c, b, d, stats, pool, rc, cleanup):
         parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     args = ap.parse_args()
     try:
-        if args.cmd in ("wait", "dashboard", "stats", "cleanup") or (args.cmd == "status" and args.no_reclaim):
+        if args.cmd in ("advise", "wait", "dashboard", "stats", "cleanup") or (args.cmd == "status" and args.no_reclaim):
             return args.func(args)
         with state_lock(ensure()):
             return args.func(args)

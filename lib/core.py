@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -22,7 +23,9 @@ import affinity
 from affinity import CC_CAP, CODEX_CAP, OPENCODE_CAP, model_for, pick_pool, score
 from locks import GitLockResolver, file_conflict, lock_context
 from scope import narrow_warnings, policy_text, scope_report
-from stats import conclusion_text, timestamp, upstream_transient
+from stats import blocked_class, conclusion_text, timestamp, upstream_transient
+from narrow import delta_text, narrow_class, retry_delta
+from handoff import build_handoff
 
 TZ = timezone(timedelta(hours=8))
 NO_SUB = (
@@ -140,6 +143,7 @@ def find_job(root, jid):
 def submission_prompt(root, job):
     """Rebuild declarations from submission fields, including for retries."""
     protected = protected_scope_paths(job, load_jobs(root, "running"))
+    job["protected_paths"] = protected
     declaration = "\n".join([
         '## 本单声明',
         '- cwd: ' + job["cwd"],
@@ -149,7 +153,10 @@ def submission_prompt(root, job):
         '- read-only: ' + ('是' if job["read_only"] else '否'),
         '', policy_text(job["scope_policy"], protected),
     ])
-    body = declaration + "\n\n" + job["user_prompt"]
+    body = declaration + "\n\n"
+    if job.get("run_delta"):
+        body += delta_text(job["run_delta"]) + "\n\n"
+    body += job["user_prompt"]
     template = root / "projects" / (job["project"] + ".md")
     if not job.get("no_template") and template.is_file():
         text = template.read_text().rstrip()
@@ -174,7 +181,7 @@ def retry_transient(root, original):
             original["retry_error"] = "original prompt unavailable; submit a new job explicitly"
             return None
     fields = ("project", "area", "tier", "cwd", "risk", "pin", "read_only", "files",
-              "shared_files", "no_template", "user_prompt", "review_of", "context_text",
+              "shared_files", "no_template", "user_prompt", "review_of", "context_text", "context_snapshot",
               "resume_of", "resume_session_id")
     job = {key: original[key] for key in fields if key in original}
     job.setdefault("files", [])
@@ -186,7 +193,9 @@ def retry_transient(root, original):
                scope_policy=original.get("scope_policy", "strict"),
                model=original.get("requested_model", original.get("model")))
     job["requested_model"] = job["model"]
+    job["run_delta"] = retry_delta(dict(original, status="failed"))
     job["warnings"] = narrow_warnings(job["files"], job["scope_policy"], job["shared_files"])
+    check_context_freshness(job)
     prompt = root / "queue" / (job["id"] + ".prompt.md")
     prompt.write_text(legacy_prompt if legacy_prompt is not None else submission_prompt(root, job))
     job["prompt_file"] = str(prompt)
@@ -204,6 +213,65 @@ def git_output(cwd, *args):
         return proc.stdout.rstrip("\n") if proc.returncode == 0 else None
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+def context_source_state(cwd, paths):
+    """Read-only Git/workspace fingerprint; unavailable evidence stays unknown."""
+    base = git_output(cwd, "rev-parse", "HEAD")
+    status = git_output(cwd, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".")
+    diff = git_output(cwd, "diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD", "--", ".")
+    untracked = git_output(cwd, "ls-files", "--others", "--exclude-standard", "-z", "--", ".")
+    if base is None or status is None or diff is None or untracked is None:
+        return base, None
+    digest = hashlib.sha256()
+    digest.update(json.dumps([status, diff]).encode())
+    try:
+        # Include source paths outside cwd and edits to already-untracked files.
+        for name in sorted(set(filter(None, untracked.split("\0"))) | set(paths)):
+            path = Path(cwd) / name
+            digest.update(name.encode())
+            if path.is_symlink():
+                digest.update(os.readlink(path).encode())
+            elif path.is_file():
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(65536), b""):
+                        digest.update(chunk)
+            else:
+                digest.update(b"missing")
+    except (OSError, ValueError):
+        return base, None
+    return base, digest.hexdigest()
+
+
+def capture_context_snapshot(cwd, specs):
+    paths = list(dict.fromkeys(str((Path(cwd) / Path(re.sub(r":-?\d+--?\d+$", "", spec)).expanduser()).resolve())
+                               for spec in specs))
+    base, fingerprint = context_source_state(cwd, paths)
+    return {"captured_at": datetime.now(TZ).isoformat(), "base_sha": base,
+            "paths": paths, "workspace_fingerprint": fingerprint}
+
+
+def check_context_freshness(job):
+    """Keep the capture baseline intact across retries; warn, never auto-resume."""
+    snapshot = job.get("context_snapshot")
+    freshness = "unknown"
+    reason = None
+    if (isinstance(snapshot, dict) and snapshot.get("captured_at") and
+            isinstance(snapshot.get("paths"), list) and
+            all(isinstance(path, str) for path in snapshot["paths"]) and job.get("cwd")):
+        base, fingerprint = context_source_state(job["cwd"], snapshot["paths"])
+        if snapshot.get("base_sha") and base and snapshot["base_sha"] != base:
+            freshness, reason = "stale", "base_sha changed"
+        elif snapshot.get("workspace_fingerprint") and fingerprint:
+            if snapshot["workspace_fingerprint"] != fingerprint:
+                freshness, reason = "stale", "workspace/source paths drifted since snapshot"
+            elif snapshot.get("base_sha") and base:
+                freshness = "fresh"
+    job["freshness"] = freshness
+    if reason:
+        warning = "context snapshot stale: " + reason + "; re-read current sources before retry/resume"
+        job["warnings"] = list(dict.fromkeys((job.get("warnings") or []) + [warning]))
+    return freshness
 
 
 def process_group_members(pgid):
@@ -318,6 +386,21 @@ def observe_running(jobs):
     return observed
 
 
+def resume_session(job, area):
+    """Shared resume eligibility; submit still validates cwd and pin."""
+    if job.get("status") in ("queued", "running"):
+        raise ValueError("原单未结束")
+    if area == "review":
+        raise ValueError("评审单不用 resume；从接手卡新开")
+    pool = job.get("pool")
+    if pool not in ("codex", "cc"):
+        raise ValueError("opencode 不支持 resume（未知池同样不支持）；从接手卡新开")
+    sid = job.get("codex_session_id" if pool == "codex" else "cc_session_id")
+    if not sid:
+        raise ValueError("原单没有会话 id，无法 resume；从接手卡新开")
+    return sid
+
+
 def job_summary(job, lines=20):
     """Bounded bot output; old records need no migration."""
     if job.get("status") == "running":
@@ -331,6 +414,8 @@ def job_summary(job, lines=20):
             elapsed = round(max(0, (end - begin).total_seconds()), 3)
         except (ValueError, TypeError):
             pass
+    job = dict(job)
+    check_context_freshness(job)
     jd = remote_dir(job["id"])
     conclusion = job.get("conclusion")
     text = ""
@@ -354,7 +439,9 @@ def job_summary(job, lines=20):
     if (jd / "last-message.md").is_file():
         result["artifacts"]["last_message"] = str(jd / "last-message.md")
     for field in ("pgid", "cancel_killed_pids", "cancel_signal", "scope_policy", "scope",
-                  "changed_files", "need_files", "retry_of", "retried_as", "raw_status", "warnings",
+                  "changed_files", "need_files", "narrow_reason_class", "run_delta",
+                  "freshness", "context_snapshot",
+                  "retry_of", "retried_as", "raw_status", "warnings",
                   "failure_reason", "failure_detail", "retry_error", "last_queue_reasons", "queue_wait_s",
                   "paused_pids", "reason_text", "line_stat", "max_added_lines"):
         if field in job:
@@ -370,6 +457,7 @@ def job_summary(job, lines=20):
             result["diff_stat"] = stat
             if "changed_files" not in job:
                 result["changed_files"] = [name for name in names.split("\0") if name]
+    result["handoff"] = build_handoff(job, result, text)
     return result
 
 
@@ -1001,6 +1089,8 @@ def reclaim(root):
                 path.strip() for line in text.splitlines() if line.strip().startswith("NEED_FILES:")
                 for path in line.strip()[len("NEED_FILES:"):].split(",") if path.strip()))
         completion_scope(job, load_jobs(root, "running"))
+        if status == "blocked" and blocked_class(job, conclusion_text(job)) == "files_narrow":
+            job["narrow_reason_class"] = narrow_class(job, conclusion_text(job))
         job["finished_at"] = datetime.now(TZ).isoformat()
         write_job(root, "done", job)
         remove_job(root, "running", job["id"])
@@ -1391,6 +1481,10 @@ def write_board(root):
                 (j.get("reason_text") or reason_text(j.get("queue_reasons", []))).replace("|", "\\|").replace("\n", " "),
             )
         )
+    lines.append("")
+    from stats import collect_stats
+    narrow = collect_stats(root)["narrow_reason_classes"]
+    lines.append("近 2h files_narrow 子因：" + " · ".join("%s=%s" % item for item in narrow.items()))
     lines.append("")
     rules = root / "RULES.md"
     if rules.exists():

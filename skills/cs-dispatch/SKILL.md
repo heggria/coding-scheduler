@@ -28,6 +28,17 @@ DoR 全部通过 AND（多文件/跨模块 OR 可后台不挡对话）？
 
 用户明确说「就在这个会话里改 / 不用 cs」时，尊重口令，即使 DoR 已过也不强派。
 
+可用 `cs advise --cwd "$PWD" --prompt-text '<请求或 Brief>' [--area backend]` 做无副作用预检，
+返回 `recommendation`（inline|plan|submit）、`reasons[]`、`missing[]`、`brief_draft` 和
+`suggested_command`；只打印，不入队、不 tick、不调用模型，也不加 `--force`。
+DoR 的规则实现见 [lib/advise.py](../../lib/advise.py)，与下方按 area 类型化的 checklist 对齐。
+缺字段时返回补齐建议和模板，不全局硬拒单；只有建议 submit 且无缺项才给可复制命令，
+否则 `suggested_command: null`。默认 area=backend；files 从 Brief 的 Files 段读取，也可用
+`--files` 覆盖；只读需显式 `--read-only` 或 Brief 的 `Read-only: true`。
+本预检是保守启发式：方案未定先 plan，小改/GUI 或工具闭环留 inline；缺 DoR 先 plan；
+DoR 齐且多文件或明确可后台则 submit；无后台信号的单文件任务倾向 inline。
+它不验证 AC 真伪、不执行 Verify、不检查运行中任务重叠或工具可用性；派发前仍须核对。
+
 ## 强制派（正例）
 
 出现 ≥2 条且 DoR 已过时，**必须** `cs submit`，不要在当前对话里直接大改：
@@ -53,15 +64,22 @@ DoR 全部通过 AND（多文件/跨模块 OR 可后台不挡对话）？
 **任一为否 → 不 submit**，回主会话补齐或改 inline：
 
 1. **Goal**：一句话目标（用户要什么）
-2. **Current → Desired**：现在什么样、改完什么样
+2. **按 area 类型化输入/交付**：编码类（backend/protocol/frontend/ui-copy/test/ops-script）
+   用 Current → Desired；research/review 用 Scope（输入、范围、证据来源）+ Deliverables（结论/报告与证据），不强求代码前后行为
 3. **Out of scope**：明确不做什么
 4. **≥2 条可测 AC**：能用命令或可观察结果判定
-5. **可写 `--files`**：具体文件路径（非目录），且与并行单**无重叠**
+5. **可写 `--files`**：具体文件路径（非目录），且与并行单**无重叠**；仅 research + read-only 允许空 files，review 即使只读仍须列文件
 6. **Decisions / Already tried**：已拍板决策、试过但无效的路径
 7. **Unknowns**：未知项（没有就写「无」；有未知且会挡实现 → 先主会话澄清）
 8. **idempotency**：唯一 `--idempotency-key`（建议 `日期-主题-短哈希`）
-9. **≥1 条 verify 命令**：worker 结束前应跑的检查（测/类型/lint/构建）
-10. **是否允许开 MR**：允许 / 禁止 / 仅准备分支（写进 prompt；写操作仍须用户授权）
+9. **≥1 条 verify 命令**：worker 结束前应跑的检查（测/类型/lint/构建）；research/review 可用只读的证据核对命令
+10. **编码类是否允许开 MR**：允许 / 禁止 / 仅准备分支（写进 prompt；写操作仍须用户授权）；research/review 不要求 MR 字段，也不因预检授予写操作权限
+
+`advise` 将 project 默认为 cwd 目录名、tier=M、pin=codex，并从 cwd/area/read-only/files/原文
+生成稳定幂等键（可用 `--project` / `--tier` / `--idempotency-key` 覆盖），不补造任务事实或授权。
+命令显式 `--no-tick`，仅供人工复制；并行文件无重叠仍由派发者在 submit 前核对。
+识别标准 Brief 英文标题及常见中文别名；AC 需分行列至少两项，Unknowns 写「无」或说明「不阻塞」。
+research/review 的 Brief 用 `Scope:` 和 `Deliverables:` 替换下方模板的 Current / Desired。
 
 并行额外约束：独占 files + 输入已在 base + 能独自证明（测/类型/lint）。共享类型、迁移、注册表入口 → 先 foundation 串行，再 fan-out。
 

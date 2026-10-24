@@ -12,7 +12,8 @@ from unittest.mock import patch
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "lib"))
 import core
-from stats import TZ, aggregate, blocked_class, collect_stats, job_event, parse_since
+from stats import TZ, aggregate, blocked_class, collect_stats, format_stats, job_event, parse_since
+from narrow import NARROW_CLASSES
 
 
 class StatsTests(unittest.TestCase):
@@ -152,6 +153,61 @@ class StatsTests(unittest.TestCase):
         self.assertEqual(event["queue_reason_types"], ["lock", "pool_full"])
         self.assertEqual(event["last_queue_reasons"], reasons)
         self.assertEqual(event["queue_wait_s"], 12.5)
+
+    def test_narrow_subcauses_preserve_parent_class_and_aggregate(self):
+        events = []
+        base = dict(status="blocked", files=["src/x.py"], need_files=["tests/test_x.py"],
+                    scope_policy="companion")
+        cases = [("companion_miss", {}), ("strict_companion_known", {"scope_policy": "strict"}),
+                 ("shared_or_core", {"protected_paths": ["tests"]}),
+                 ("permission_or_lock", {"read_only": True}),
+                 ("unclear_input", {"need_files": ["src/x.py"]}),
+                 ("other", {"scope_policy": "strict", "need_files": ["src/business.py"]})]
+        for kind, extra in cases:
+            event = job_event(self.job(kind, **dict(base, **extra)))
+            self.assertEqual(event["blocked_reason_class"], "files_narrow")
+            self.assertEqual(event["narrow_reason_class"], kind)
+            self.assertEqual(event["outcome_class"], "task")
+            events.append(event)
+        grouped = aggregate(events)
+        self.assertEqual(grouped["narrow_reason_classes"], dict.fromkeys(NARROW_CLASSES, 1))
+        self.assertEqual(grouped["blocked_reason_classes"]["files_narrow"], 6)
+        self.assertIsNone(job_event(self.job(need_files=["tests/test_x.py"]))["narrow_reason_class"])
+
+    def test_old_events_enrich_subcause_read_only_even_with_outcome_class(self):
+        job = self.job(status="blocked", files=["src/x.py"], need_files=["tests/test_x.py"],
+                       scope_policy="strict")
+        self.save(job)
+        event = job_event(job)
+        event.pop("narrow_reason_class")
+        logs = self.root / "logs"
+        logs.mkdir()
+        path = logs / "events.jsonl"
+        path.write_text(json.dumps(event) + "\n")
+        before = {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+        result = collect_stats(self.root, now=self.now)
+        self.assertEqual(result["narrow_reason_classes"]["strict_companion_known"], 1)
+        self.assertEqual(result["by_pool"]["codex"]["narrow_reason_classes"]["strict_companion_known"], 1)
+        self.assertIn("strict_companion_known=1", format_stats(result))
+        self.assertEqual(before, {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()})
+        # Rotated events without a done record have insufficient attribution evidence.
+        (self.root / "done/one.json").unlink()
+        result = collect_stats(self.root, now=self.now)
+        self.assertEqual(result["narrow_reason_classes"]["unclear_input"], 1)
+
+    def test_new_event_subcause_is_not_reclassified_from_a_changed_conclusion(self):
+        job = self.job(status="blocked", files=["src/x.py"], need_files=["tests/test_x.py"],
+                       scope_policy="strict")
+        self.save(dict(job, scope_policy="companion"))
+        logs = self.root / "logs"
+        logs.mkdir()
+        (logs / "events.jsonl").write_text(json.dumps(job_event(job)) + "\n")
+        result = collect_stats(self.root, now=self.now)
+        self.assertEqual(result["narrow_reason_classes"]["strict_companion_known"], 1)
+        self.assertEqual(result["narrow_reason_classes"]["companion_miss"], 0)
+        # Backfill also preserves the attribution captured at completion.
+        saved = dict(job, scope_policy="companion", narrow_reason_class="strict_companion_known")
+        self.assertEqual(job_event(saved)["narrow_reason_class"], "strict_companion_known")
 
 
 if __name__ == "__main__":

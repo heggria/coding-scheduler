@@ -5,6 +5,8 @@ import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from narrow import NARROW_CLASSES, narrow_class
+
 TZ = timezone(timedelta(hours=8))
 TERMINAL = ("done", "blocked", "failed", "unknown", "cancelled")
 POOLS = ("codex", "cc", "opencode")
@@ -130,6 +132,8 @@ def job_event(job):
                 any(line.strip() == "STATUS: DONE" for line in text.splitlines()))
     event["outcome_class"] = outcome_class(event["status"], event["failure_reason"], event["exit"],
                                            event["blocked_reason_class"])
+    event["narrow_reason_class"] = ((job.get("narrow_reason_class") or narrow_class(job, text))
+                                   if event["blocked_reason_class"] == "files_narrow" else None)
     return event
 
 
@@ -143,10 +147,14 @@ def cancel_reason(job):
 
 def classify_event(event, job=None):
     """Old events predate outcome fields: borrow them from the done record when available."""
-    if "outcome_class" in event:
-        return event
     event = dict(event)
     source = job if isinstance(job, dict) else event
+    if "narrow_reason_class" not in event:
+        event["narrow_reason_class"] = ((source.get("narrow_reason_class") or
+                                         narrow_class(source, conclusion_text(source)))
+            if event.get("blocked_reason_class") == "files_narrow" else None)
+    if "outcome_class" in event:
+        return event
     event.setdefault("failure_reason", source.get("failure_reason"))
     event.setdefault("cancel_reason", cancel_reason(dict(source, status=event.get("status"))))
     event["outcome_class"] = outcome_class(event.get("status"), event.get("failure_reason"),
@@ -182,6 +190,8 @@ def aggregate(events):
             "prompt_samples": len(prompts),
             "blocked_reason_classes": {c: sum(e.get("blocked_reason_class") == c for e in events)
                                        for c in classes},
+            "narrow_reason_classes": {c: sum(e.get("narrow_reason_class") == c for e in events)
+                                      for c in NARROW_CLASSES},
             "cancelled_after_done": sum(e.get("cancelled_after_done") is True for e in events),
             "outcome_classes": outcomes,
             # Excludes operator cancels, external signals and infra errors; None when nothing is left.
@@ -267,6 +277,7 @@ def format_stats(result):
     return "\n".join(["Window: %s → %s" % (result["since"], result["until"]), row("All", result),
                       breakdown(result),
                       "Failure reasons: " + reasons(result["failure_reasons"]),
+                      "Files narrow: " + reasons(result["narrow_reason_classes"]),
                       "Cancel reasons: " + reasons(result["cancel_reasons"])] +
                      [row("Pool " + p, g) + "\n  " + breakdown(g) for p, g in result["by_pool"].items()] +
                      [row("Project " + p, g) + "\n  " + breakdown(g) for p, g in result["by_project"].items()])
